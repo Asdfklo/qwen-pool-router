@@ -234,13 +234,23 @@ def _get_gpu_snapshot() -> tuple[dict, dict]:
 
 
 def _resolve_backend_gpu_info(cfg) -> dict | None:
-    """Resolve real GPU info for a backend, or None if not on a GPU."""
+    """Resolve real GPU info for a backend.
+
+    Returns the gpu dict if the backend's process is on a GPU, or the
+    sentinel {"no_gpu": True} if nvidia-smi is available but the process
+    is not on any GPU (i.e. CPU model). Returns None if nvidia-smi is
+    unavailable entirely (fall back to watchdog).
+    """
     if cfg.hardware == "cpu":
         return None
     gpus, pid_map = _get_gpu_snapshot()
     if not gpus:
-        return None
-    return _resolve_backend_gpu(cfg.api_base, gpus, pid_map)
+        return None  # no nvidia-smi: fall back to watchdog
+    resolved = _resolve_backend_gpu(cfg.api_base, gpus, pid_map)
+    if resolved is not None:
+        return resolved
+    # nvidia-smi available but this backend's process isn't on any GPU
+    return {"no_gpu": True}
 
 
 class BackendConfig(BaseModel):
@@ -1887,13 +1897,19 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
     hw = cfg.hardware if cfg.hardware != "auto" else ("cpu" if not gpu else "gpu")
     if hw == "cpu":
         gpu = _get_cpu_ram_info()
+        hw = "cpu"
     else:
         # Prefer real per-backend GPU data via nvidia-smi (handles multi-GPU
-        # hosts where the watchdog only sees the default GPU). Falls back to
-        # the watchdog's gpu report if resolution fails.
+        # hosts where the watchdog only sees the default GPU).
         resolved = _resolve_backend_gpu_info(cfg)
-        if resolved:
+        if resolved is None:
+            pass  # nvidia-smi unavailable: keep watchdog gpu data
+        elif resolved.get("no_gpu"):
+            gpu = _get_cpu_ram_info()  # CPU model: show host RAM
+            hw = "cpu"
+        else:
             gpu = resolved
+            hw = "gpu"
     now = time.time()
     active_ages = [max(0.0, now - started_at) for started_at in backend.active_leases.values()]
     return {
