@@ -748,7 +748,7 @@ class RouterState:
 def _open_telemetry_db(config: RouterConfig) -> sqlite3.Connection:
     db_path = Path(config.telemetry_db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=5)
+    connection = sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("CREATE TABLE IF NOT EXISTS router_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
