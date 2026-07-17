@@ -306,3 +306,14 @@ def test_cpu_backend_reports_cpu_model():
     snap = backend_snapshot(state)
     assert snap["hardware_type"] == "cpu"
     assert snap.get("cpu_model"), "snapshot missing cpu_model"
+
+
+def test_dashboard_no_hard_minwidth_and_scroll_wrapper():
+    """Regression: table must not force page overflow via a hard min-width,
+    and must be wrapped in a horizontal scroll container."""
+    from hermes_router import dashboard_html
+    html = dashboard_html("9.9.9")
+    assert "scroll-x" in html, "table missing horizontal scroll wrapper"
+    assert "min-width: 320px" not in html, "node-gauges hard min-width would force overflow"
+    # The table should carry a min-width so it scrolls rather than squishes
+    assert "min-width: 760px" in html, "table needs a min-width to scroll predictably"

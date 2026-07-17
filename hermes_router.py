@@ -2307,7 +2307,8 @@ def dashboard_html(title: str) -> str:
     .grid {{ display: grid; gap: 12px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 56px 0 12px; }}
     .two {{ grid-template-columns: minmax(0, 1fr) minmax(360px, 0.7fr); }}
-    .card {{ border: 1px solid var(--line); padding: 24px; background: transparent; box-shadow: none; min-width: 0; }}
+    .card {{ border: 1px solid var(--line); padding: 24px; background: transparent; box-shadow: none; min-width: 0; overflow: hidden; }}
+    .scroll-x {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
     .cardhead {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 18px; border-bottom: 1px solid var(--line); padding-bottom: 14px; }}
     .card h3 {{ margin: 0; font-size: 1.5rem; font-weight: 700; letter-spacing: -0.04em; line-height: 1.1; }}
     .metric {{ border: 1px solid var(--line); padding: 24px 20px; }}
@@ -2316,8 +2317,8 @@ def dashboard_html(title: str) -> str:
     .metric .duration-value {{ display: flex; align-items: baseline; flex-wrap: nowrap; white-space: nowrap; }}
     .metric-unit {{ color: var(--muted); font-size: 0.34em; font-weight: 700; letter-spacing: 0.02em; line-height: 1; margin-left: 0.22em; }}
     .metric .hint {{ color: var(--muted); font-size: 0.875rem; margin-top: 14px; min-height: 18px; line-height: 1.5; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{ text-align: left; padding: 16px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
+    th, td {{ text-align: left; padding: 16px 8px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }}
     th {{ color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.14em; font-weight: 700; font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace; }}
     td {{ font-size: 0.88rem; }}
     code {{ color: var(--accent); }}
@@ -2329,8 +2330,9 @@ def dashboard_html(title: str) -> str:
     .muted {{ color: var(--muted); }}
     .bar {{ height: 10px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; margin-top: 9px; }}
     .fill {{ height: 100%; background: linear-gradient(90deg, var(--good), var(--warn) 68%, var(--accent)); }}
-    .node-gauges {{ display: grid; grid-template-columns: 1.5fr 1fr 0.8fr; gap: 14px; min-width: 320px; }}
-    .gauge-label {{ color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.12em; font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace; }}
+    .node-gauges {{ display: grid; grid-template-columns: 1fr; gap: 8px; min-width: 0; }}
+    .node-gauges .gauge {{ display: grid; grid-template-columns: 78px 1fr; gap: 12px; align-items: center; }}
+    .gauge-label {{ color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.12em; white-space: nowrap; }}
     .gauge-value {{ margin-top: 6px; font-weight: 700; }}
     .route {{ display: grid; grid-template-columns: 86px 1fr auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }}
     .route:last-child {{ border-bottom: 0; }}
@@ -2358,13 +2360,13 @@ def dashboard_html(title: str) -> str:
       .metrics {{ grid-template-columns: repeat(3, 1fr); }}
       .two {{ grid-template-columns: 1fr; }}
       .three {{ grid-template-columns: repeat(3, 1fr); }}
-      table {{ display: block; overflow-x: auto; }}
     }}
     @media (max-width: 600px) {{
       .metrics {{ grid-template-columns: repeat(2, 1fr); }}
       .two, .three {{ grid-template-columns: 1fr; }}
       .card {{ padding: 20px; }}
       .cardhead {{ align-items: flex-start; flex-direction: column; }}
+      .node-gauges .gauge {{ grid-template-columns: 64px 1fr; gap: 8px; }}
     }}
   </style>
 </head>
@@ -2427,10 +2429,12 @@ def dashboard_html(title: str) -> str:
     <section class="grid">
       <div class="card">
       <div class="cardhead"><h3>Node Targets</h3><span class="muted mono">watchdog + llama health</span></div>
+      <div class="scroll-x">
       <table>
         <thead><tr><th>Status</th><th>Target</th><th>Model</th><th>Context</th><th>Slots</th><th>Requests</th><th>Device &amp; Util</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>Last Route</th></tr></thead>
         <tbody id="backendRows"></tbody>
       </table>
+      </div>
     </div>
   </section>
 
@@ -2660,10 +2664,10 @@ function render(data) {{
       <td>${{b.active_requests}}/${{b.max_parallel_requests}}<div class="muted">avg ${{b.latency_ms_average || 0}} ms</div><div class="muted">ETA ${{duration(b.estimated_finish_ms)}} · circuit ${{esc(b.circuit_state)}}${{staleResetText}}</div></td>
       <td><strong>${{fmt.format(nodeRoutes.length)}}</strong><div class="muted">${{nodeSuccess}} ok · ${{nodeFailed}} failed</div></td>
       <td><div class="node-gauges">
-        <div><div class="gauge-label">${{memLabel}}</div><div class="gauge-value">${{gpuMem}}</div><div class="bar"><div class="fill" style="width:${{gpuUsed}}%"></div></div></div>
-        <div class="muted mono" style="font-size:0.7rem;margin-top:4px"><strong>Device:</strong> ${{esc(gpuName)}}</div>
-        <div style="margin-top:4px"><div class="gauge-label">Util</div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div>
-        ${{isCpu ? "" : `<div style="margin-top:4px"><div class="gauge-label">Temp</div><div class="gauge-value">${{gpuTemp}}</div></div>`}}
+        <div class="gauge"><div class="gauge-label">${{memLabel}}</div><div><div class="gauge-value">${{gpuMem}}</div><div class="bar"><div class="fill" style="width:${{gpuUsed}}%"></div></div></div></div>
+        <div class="gauge"><div class="gauge-label">Device</div><div><div class="muted mono" style="font-size:0.7rem">${{esc(gpuName)}}</div></div></div>
+        <div class="gauge"><div class="gauge-label">Util</div><div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div></div>
+        ${{isCpu ? "" : `<div class="gauge"><div class="gauge-label">Temp</div><div><div class="gauge-value">${{gpuTemp}}</div></div></div>`}}
       </div></td>
       <td><div class="mono">${{promptTps}}</div></td>
       <td><div class="mono">${{genTps}}</div></td>
