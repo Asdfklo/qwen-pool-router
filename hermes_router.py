@@ -68,6 +68,181 @@ def _get_cpu_ram_info() -> dict[str, Any]:
         return {}
 
 
+def _parse_nvidia_smi() -> tuple[dict[str, dict], dict[int, str]]:
+    """Return (gpu_by_uuid, pid_to_uuid) from nvidia-smi.
+
+    gpu_by_uuid: uuid -> {index, name, memory_total_mb, memory_used_mb,
+                          memory_free_mb, utilization_percent, temperature_c}
+    pid_to_uuid: process pid -> gpu uuid it is running on
+    Empty dicts if nvidia-smi is unavailable (e.g. no NVIDIA GPUs).
+    """
+    gpus: dict[str, dict] = {}
+    pid_map: dict[int, str] = {}
+    try:
+        import subprocess
+        gpu_out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid,index,name,memory.total,memory.used,"
+             "memory.free,utilization.gpu,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if gpu_out.returncode == 0:
+            for line in gpu_out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 8:
+                    continue
+                uuid, idx, name, total, used, free, util, temp = parts[:8]
+                gpus[uuid] = {
+                    "index": int(idx),
+                    "name": name,
+                    "memory_total_mb": int(float(total)),
+                    "memory_used_mb": int(float(used)),
+                    "memory_free_mb": int(float(free)),
+                    "utilization_percent": float(util),
+                    "temperature_c": float(temp),
+                }
+        app_out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if app_out.returncode == 0:
+            for line in app_out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2:
+                    try:
+                        pid_map[int(parts[0])] = parts[1]
+                    except ValueError:
+                        pass
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return gpus, pid_map
+
+
+def _find_pid_for_port(port: int) -> int | None:
+    """Find the PID listening on a local TCP port via /proc (Linux only)."""
+    try:
+        import glob
+        import os
+        import re
+        for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+            if not os.path.exists(tcp_file):
+                continue
+            with open(tcp_file) as f:
+                next(f)  # skip header
+                for line in f:
+                    cols = line.split()
+                    if len(cols) < 4:
+                        continue
+                    local = cols[1]
+                    state = cols[3]
+                    if state != "0A":  # LISTEN
+                        continue
+                    # local addr format: hexIP:hexPORT
+                    lport = int(local.split(":")[1], 16)
+                    if lport == port:
+                        inode = cols[9]
+                        for fdlink in glob.glob("/proc/*/fd/*"):
+                            try:
+                                if os.readlink(fdlink).endswith("socket:[" + inode + "]"):
+                                    return int(fdlink.split("/")[2])
+                            except (OSError, ValueError, IndexError):
+                                continue
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _resolve_backend_gpu(api_base: str, gpu_by_uuid: dict, pid_map: dict) -> dict | None:
+    """Resolve the real GPU a backend's model process runs on.
+
+    Handles the proxy case: if the listening PID on api_base's port is a
+    proxy (not a llama-server), follow its outbound connection to the
+    upstream llama-server port and resolve that PID instead.
+    Returns a gpu dict from gpu_by_uuid, or None if unresolved.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(api_base).hostname or "127.0.0.1"
+        port = urlparse(api_base).port
+        if not port:
+            return None
+        if host not in ("127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", None):
+            return None  # remote backend: can't query local nvidia-smi
+        pid = _find_pid_for_port(port)
+        if pid is None:
+            return None
+        # If this PID isn't on a GPU, it may be a proxy (caddy). Follow its
+        # outbound connections to find the upstream llama-server port.
+        if pid not in pid_map:
+            upstream = _find_upstream_port(pid)
+            if upstream:
+                pid = _find_pid_for_port(upstream)
+        if pid is None or pid not in pid_map:
+            return None
+        uuid = pid_map[pid]
+        return gpu_by_uuid.get(uuid)
+    except Exception:
+        return None
+
+
+def _find_upstream_port(proxy_pid: int) -> int | None:
+    """Find the local port a proxy process is connected to (its upstream)."""
+    try:
+        import glob
+        import os
+        inodes: set[str] = set()
+        for fdlink in glob.glob(f"/proc/{proxy_pid}/fd/*"):
+            try:
+                target = os.readlink(fdlink)
+                if target.startswith("socket:["):
+                    inodes.add(target[8:-1])
+            except OSError:
+                continue
+        for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+            if not os.path.exists(tcp_file):
+                continue
+            with open(tcp_file) as f:
+                next(f)
+                for line in f:
+                    cols = line.split()
+                    if len(cols) < 4:
+                        continue
+                    if cols[3] != "01":  # ESTABLISHED
+                        continue
+                    if cols[9] in inodes:
+                        remote = cols[2]
+                        return int(remote.split(":")[1], 16)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+# Cache nvidia-smi parses for a short window to avoid hammering it
+_GPU_CACHE: tuple[float, dict, dict] | None = None
+_GPU_CACHE_TTL = 5.0
+
+
+def _get_gpu_snapshot() -> tuple[dict, dict]:
+    global _GPU_CACHE
+    now = time.time()
+    if _GPU_CACHE and now - _GPU_CACHE[0] < _GPU_CACHE_TTL:
+        return _GPU_CACHE[1], _GPU_CACHE[2]
+    gpus, pid_map = _parse_nvidia_smi()
+    _GPU_CACHE = (now, gpus, pid_map)
+    return gpus, pid_map
+
+
+def _resolve_backend_gpu_info(cfg) -> dict | None:
+    """Resolve real GPU info for a backend, or None if not on a GPU."""
+    if cfg.hardware == "cpu":
+        return None
+    gpus, pid_map = _get_gpu_snapshot()
+    if not gpus:
+        return None
+    return _resolve_backend_gpu(cfg.api_base, gpus, pid_map)
+
+
 class BackendConfig(BaseModel):
     name: str
     api_base: str
@@ -1712,6 +1887,13 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
     hw = cfg.hardware if cfg.hardware != "auto" else ("cpu" if not gpu else "gpu")
     if hw == "cpu":
         gpu = _get_cpu_ram_info()
+    else:
+        # Prefer real per-backend GPU data via nvidia-smi (handles multi-GPU
+        # hosts where the watchdog only sees the default GPU). Falls back to
+        # the watchdog's gpu report if resolution fails.
+        resolved = _resolve_backend_gpu_info(cfg)
+        if resolved:
+            gpu = resolved
     now = time.time()
     active_ages = [max(0.0, now - started_at) for started_at in backend.active_leases.values()]
     return {
@@ -1741,6 +1923,7 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
         "ready_reason": watchdog.get("reason"),
         "process_matches": watchdog.get("process_matches") or [],
         "gpu": gpu,
+        "gpu_name": gpu.get("name") if isinstance(gpu, dict) else None,
         "hardware_type": hw,
         "llama": llama,
         "watchdog_checked_at": watchdog.get("checked_at"),
@@ -2415,6 +2598,7 @@ function render(data) {{
     const gpuTemp = (b.gpu && b.gpu.temperature_c != null) ? (b.gpu.temperature_c + " C") : "n/a";
     const gpuMem = (b.gpu && b.gpu.memory_used_mb != null) ? (gb(b.gpu.memory_used_mb) + " / " + gb(b.gpu.memory_total_mb)) : "n/a";
     const memLabel = isCpu ? "RAM" : "VRAM";
+    const gpuName = (b.gpu && b.gpu.name) ? b.gpu.name : (b.gpu_name || "n/a");
     const promptTps = b.prompt_tokens_per_sec > 0 ? b.prompt_tokens_per_sec.toFixed(1) : "n/a";
     const genTps = b.generated_tokens_per_sec > 0 ? b.generated_tokens_per_sec.toFixed(1) : "n/a";
     const semanticText = b.semantic_healthy == null
@@ -2442,6 +2626,7 @@ function render(data) {{
       <td><strong>${{fmt.format(nodeRoutes.length)}}</strong><div class="muted">${{nodeSuccess}} ok · ${{nodeFailed}} failed</div></td>
       <td><div class="node-gauges">
         <div><div class="gauge-label">${{memLabel}}</div><div class="gauge-value">${{gpuMem}}</div><div class="bar"><div class="fill" style="width:${{gpuUsed}}%"></div></div></div>
+        <div class="muted mono" style="font-size:0.7rem;margin-top:2px">${{esc(gpuName)}}</div>
         <div><div class="gauge-label">${{isCpu ? "RAM Load" : "Util"}}</div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div>
         ${{isCpu ? "" : `<div><div class="gauge-label">Temp</div><div class="gauge-value">${{gpuTemp}}</div></div>`}}
       </div></td>

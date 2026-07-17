@@ -247,3 +247,46 @@ def test_dashboard_html_renders_with_cpu_backend():
     # CPU backend shows RAM, GPU shows VRAM in the JS label logic
     assert "RAM" in html
     assert "VRAM" in html
+
+
+def test_resolve_backend_gpu_local_multi_gpu():
+    """Unit test: nvidia-smi PID->GPU mapping resolves correct GPU for a local backend."""
+    from hermes_router import _parse_nvidia_smi, _find_pid_for_port, _resolve_backend_gpu
+
+    gpus, pid_map = _parse_nvidia_smi()
+    if not gpus:
+        pytest.skip("no nvidia-smi / no GPUs on this host")
+
+    # Find a backend port that maps to a real GPU process
+    import socket
+    # Use an actually-listening local llama port if discoverable
+    test_ports = [8084, 8081, 18081]
+    resolved_any = False
+    for port in test_ports:
+        pid = _find_pid_for_port(port)
+        if pid is None:
+            continue
+        # follow proxy if needed
+        if pid not in pid_map:
+            from hermes_router import _find_upstream_port
+            up = _find_upstream_port(pid)
+            if up:
+                pid = _find_pid_for_port(up)
+        if pid in pid_map:
+            uuid = pid_map[pid]
+            assert uuid in gpus, f"resolved uuid {uuid} not in gpu list"
+            info = _resolve_backend_gpu(f"http://127.0.0.1:{port}/v1", gpus, pid_map)
+            assert info is not None
+            assert "memory_total_mb" in info
+            assert "name" in info
+            resolved_any = True
+    # At least one local model should be GPU-backed on this box
+    assert resolved_any, "no GPU-backed local backend found to test"
+
+
+def test_resolve_backend_gpu_remote_returns_none():
+    """Remote backends cannot be resolved via local nvidia-smi."""
+    from hermes_router import _resolve_backend_gpu, _parse_nvidia_smi
+    gpus, pid_map = _parse_nvidia_smi()
+    result = _resolve_backend_gpu("http://192.168.1.50:8080/v1", gpus, pid_map)
+    assert result is None
