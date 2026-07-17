@@ -191,3 +191,231 @@ def test_old_config_and_optional_backend_routes() -> None:
     assert reasoning_backend_filter(routed, "none") == ({"off"}, False)
     assert reasoning_backend_filter(routed, "high") == ({"high"}, False)
     assert reasoning_backend_filter(routed, "medium") == (None, True)
+
+
+def test_completions_prompt_processing() -> None:
+    from hermes_router import (
+        _extract_prompt_text_from_payload,
+        estimate_prompt_tokens,
+        append_text_to_last_user_message,
+    )
+
+    # 1. Test _extract_prompt_text_from_payload
+    assert _extract_prompt_text_from_payload({"prompt": "Hello"}) == "Hello"
+    assert _extract_prompt_text_from_payload({"prompt": ["Hello", "World"]}) == "Hello World"
+    assert _extract_prompt_text_from_payload({"prompt": ["Hello", 123, {"text": "Obj"}]}) == "Hello <token_id_123> Obj"
+    assert _extract_prompt_text_from_payload({"prompt": {"text": "Object prompt"}}) == "Object prompt"
+    assert _extract_prompt_text_from_payload({}) == ""
+
+    # 2. Test estimate_prompt_tokens on completions prompt
+    assert estimate_prompt_tokens({"prompt": "A" * 100}) == 25
+
+    # 3. Test append_text_to_last_user_message on completions prompt
+    res1 = append_text_to_last_user_message({"prompt": "Hello"}, " /think")
+    assert res1["prompt"] == "Hello /think"
+
+    res2 = append_text_to_last_user_message({"prompt": ["Hello", "World"]}, " /think")
+    assert res2["prompt"] == ["Hello", "World /think"]
+
+
+def test_llama_health_caching_and_parallelization() -> None:
+    import asyncio
+    import time
+    from hermes_router import BackendState, BackendConfig, llama_healthy, choose_backend, RouterState
+    import httpx
+
+    config = RouterConfig.model_validate({
+        "backends": [
+            {"name": "b1", "api_base": "http://127.0.0.1:9091/v1"},
+            {"name": "b2", "api_base": "http://127.0.0.1:9092/v1"}
+        ]
+    })
+    state = RouterState(config)
+    b1 = state.backends[0]
+    b1.last_watchdog_status = {"ready": True}
+    b2 = state.backends[1]
+    b2.last_watchdog_status = {"ready": True}
+
+    call_count = 0
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"status": "ok"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mock_handler)) as client:
+            # First health check (no cache)
+            res1 = await llama_healthy(client, b1, cache_seconds=5.0)
+            assert res1 is True
+            assert call_count == 1
+
+            # Second health check (cached)
+            res2 = await llama_healthy(client, b1, cache_seconds=5.0)
+            assert res2 is True
+            assert call_count == 1  # Should not increase
+
+            # Choose backend parallel check should use cache as well
+            res_choose = await choose_backend(
+                client=client,
+                state=state,
+                payload={"prompt": "test"},
+                request_id=1
+            )
+            assert res_choose is not None
+            # b1 is cached, but b2 needs check
+            assert call_count == 2
+
+    asyncio.run(run())
+
+
+def test_responses_and_infill_routing() -> None:
+    from hermes_router import create_app, RouterConfig, RouterState
+    import asyncio
+    import httpx
+
+    config = RouterConfig.model_validate({
+        "backends": [
+            {"name": "b1", "api_base": "http://127.0.0.1:9091/v1", "backend_model": "custom-qwen"}
+        ]
+    })
+    app = create_app(config)
+    app.state.router_state = RouterState(config)
+    app.state.config = config
+
+    b1 = app.state.router_state.backends[0]
+    b1.last_watchdog_status = {"ready": True}
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200, json={"status": "ok"})
+        # Check that /v1/responses or /infill was passed down correctly to backend
+        return httpx.Response(200, json={"routed_path": request.url.path, "received": True})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mock_handler)) as upstream_client:
+            app.state.http = upstream_client
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                # 1. Test /v1/responses
+                res = await client.post("/v1/responses", json={"input": "test prompt"})
+                assert res.status_code == 200
+                assert res.json() == {"routed_path": "/v1/responses", "received": True}
+
+                # 2. Test /infill
+                res_infill = await client.post("/infill", json={"input": "prefix", "suffix": "suffix"})
+                assert res_infill.status_code == 200
+                assert res_infill.json() == {"routed_path": "/infill", "received": True}
+
+    asyncio.run(run())
+
+
+def test_dynamic_models_listing() -> None:
+    from hermes_router import create_app, RouterConfig, RouterState
+    import asyncio
+    import httpx
+
+    config = RouterConfig.model_validate({
+        "backends": [
+            {"name": "b1", "api_base": "http://127.0.0.1:9091/v1", "backend_model": "gemma-2"},
+            {"name": "b2", "api_base": "http://127.0.0.1:9092/v1", "backend_model": "qwen-3.6-35b"}
+        ],
+        "reasoning": {"expose_reasoning_models": True}
+    })
+    app = create_app(config)
+    app.state.router_state = RouterState(config)
+    app.state.config = config
+
+    async def run() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.get("/v1/models")
+            assert res.status_code == 200
+            data = res.json()["data"]
+            model_ids = [item["id"] for item in data]
+            assert "gemma-2" in model_ids
+            assert "gemma-2:high" in model_ids
+            assert "qwen-3.6-35b" in model_ids
+            assert "qwen-3.6-35b:low" in model_ids
+
+    asyncio.run(run())
+
+
+def test_user_dictated_thinking_budget() -> None:
+    from hermes_router import create_app, RouterConfig, RouterState
+    import asyncio
+    import httpx
+
+    config = RouterConfig.model_validate({
+        "backends": [
+            {"name": "b1", "api_base": "http://127.0.0.1:9091/v1", "backend_model": "custom-qwen"}
+        ]
+    })
+    app = create_app(config)
+    app.state.router_state = RouterState(config)
+    app.state.config = config
+
+    b1 = app.state.router_state.backends[0]
+    b1.last_watchdog_status = {"ready": True}
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200, json={"status": "ok"})
+        import json
+        payload = json.loads(request.content)
+        # Ensure that reasoning_budget was overwritten by client's dictation
+        return httpx.Response(200, json={"received_budget": payload.get("reasoning_budget")})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mock_handler)) as upstream_client:
+            app.state.http = upstream_client
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                # Dictate budget in payload
+                res = await client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], "thinking_budget": 999})
+                assert res.status_code == 200
+                assert res.json()["received_budget"] == 999
+
+                # Dictate budget in header
+                res2 = await client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}, headers={"x-thinking-budget": "123"})
+                assert res2.status_code == 200
+                assert res2.json()["received_budget"] == 123
+
+    asyncio.run(run())
+
+
+def test_catch_all_proxy_endpoint() -> None:
+    from hermes_router import create_app, RouterConfig, RouterState
+    import asyncio
+    import httpx
+
+    config = RouterConfig.model_validate({
+        "backends": [
+            {"name": "b1", "api_base": "http://127.0.0.1:9091/v1", "backend_model": "custom-qwen"}
+        ]
+    })
+    app = create_app(config)
+    app.state.router_state = RouterState(config)
+    app.state.config = config
+
+    b1 = app.state.router_state.backends[0]
+    b1.last_watchdog_status = {"ready": True}
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(200, json={"path_routed": request.url.path, "params": dict(request.url.params)})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mock_handler)) as upstream_client:
+            app.state.http = upstream_client
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                res = await client.post("/v1/some/new/endpoint?foo=bar", json={})
+                assert res.status_code == 200
+                assert res.json() == {"path_routed": "/v1/some/new/endpoint", "params": {"foo": "bar"}}
+
+    asyncio.run(run())
