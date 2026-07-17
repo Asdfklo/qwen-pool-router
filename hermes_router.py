@@ -2289,8 +2289,8 @@ def dashboard_html(title: str) -> str:
     .app {{ min-height: 100vh; }}
     aside {{ border-left: 1px solid var(--line); background: rgba(10,10,10,0.98); padding: 32px 24px; position: fixed; inset: 0 0 0 auto; width: min(340px, 86vw); transform: translateX(100%); transition: transform 200ms cubic-bezier(0.25,0,0,1); z-index: 30; }}
     body.menu-open aside {{ transform: translateX(0); }}
-    .drawer-backdrop {{ position: fixed; inset: 0; background: rgba(10,10,10,0.72); border: 0; opacity: 0; pointer-events: none; transition: opacity 150ms cubic-bezier(0.25,0,0,1); z-index: 20; }}
-    body.menu-open .drawer-backdrop {{ opacity: 1; pointer-events: auto; }}
+    .drawer-backdrop {{ position: fixed; inset: 0; background: rgba(10,10,10,0.72); border: 0; opacity: 0; pointer-events: none; transition: opacity 150ms cubic-bezier(0.25,0,0,1), visibility 150ms; z-index: 20; visibility: hidden; }}
+    body.menu-open .drawer-backdrop {{ opacity: 1; pointer-events: auto; visibility: visible; }}
     main {{ padding: 48px 64px 64px; max-width: 1480px; width: 100%; margin: 0 auto; }}
     .brand {{ display: flex; gap: 12px; align-items: center; margin-bottom: 24px; }}
     .logo {{ width: 44px; height: 44px; background: var(--accent); display: grid; place-items: center; color: var(--accent-foreground); font-weight: 900; letter-spacing: -0.06em; }}
@@ -2301,6 +2301,7 @@ def dashboard_html(title: str) -> str:
     .pill {{ border: 1px solid var(--line); padding: 11px 12px; background: transparent; color: var(--muted); font-size: 0.875rem; min-height: 44px; display: inline-flex; align-items: center; }}
     .menu-button {{ background: transparent; color: var(--text); border: 0; border-bottom: 2px solid var(--accent); padding: 10px 0; min-height: 44px; text-transform: uppercase; letter-spacing: 0.12em; cursor: pointer; }}
     .menu-button:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
+    .window-button:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
     .topbar {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 18px; }}
     .titleblock h2 {{ margin: 0; font-size: clamp(3rem, 7vw, 6.5rem); letter-spacing: -0.06em; line-height: 0.9; max-width: 900px; text-transform: uppercase; }}
     .titleblock p {{ margin: 22px 0 0; color: var(--muted); max-width: 680px; font-size: 1.125rem; line-height: 1.6; }}
@@ -2377,9 +2378,12 @@ def dashboard_html(title: str) -> str:
 <div class="app">
   <button class="drawer-backdrop" id="drawerBackdrop" aria-label="Close NYX router menu"></button>
   <aside id="routerDrawer" role="dialog" aria-modal="true" aria-label="NYX router menu" aria-hidden="true" inert tabindex="-1">
-    <div class="brand">
-      <div class="logo">NYX</div>
-      <div><h1>NYX_Router</h1><div class="sub">llama.cpp router telemetry</div></div>
+    <div class="brand" style="justify-content: space-between; width: 100%">
+      <div style="display:flex; gap:12px; align-items:center">
+        <div class="logo">NYX</div>
+        <div><h1>NYX_Router</h1><div class="sub">llama.cpp router telemetry</div></div>
+      </div>
+      <button class="menu-button" id="closeDrawerButton" type="button" aria-label="Close menu" style="border-bottom:none; min-height:auto; padding:4px 8px">✕</button>
     </div>
     <div class="navcard">
       <div class="navtitle">Scrape Target</div>
@@ -2407,11 +2411,11 @@ def dashboard_html(title: str) -> str:
       </div>
     </div>
 
-    <div class="window-controls" aria-label="Telemetry time window">
-      <button class="window-button" data-window="900000">15m</button>
-      <button class="window-button" data-window="3600000">1h</button>
-      <button class="window-button" data-window="21600000">6h</button>
-      <button class="window-button active" data-window="86400000">24h</button>
+    <div class="window-controls" aria-label="Telemetry time window" role="group">
+      <button class="window-button" data-window="900000" aria-label="Show last 15 minutes of telemetry" aria-pressed="false">15m</button>
+      <button class="window-button" data-window="3600000" aria-label="Show last 1 hour of telemetry" aria-pressed="false">1h</button>
+      <button class="window-button" data-window="21600000" aria-label="Show last 6 hours of telemetry" aria-pressed="false">6h</button>
+      <button class="window-button active" data-window="86400000" aria-label="Show last 24 hours of telemetry" aria-pressed="true">24h</button>
     </div>
 
     <section class="grid metrics">
@@ -2834,12 +2838,17 @@ function setMenu(open) {{
 }}
 menuButton.addEventListener("click", () => setMenu(!document.body.classList.contains("menu-open")));
 drawerBackdrop.addEventListener("click", () => setMenu(false));
+document.getElementById("closeDrawerButton").addEventListener("click", () => setMenu(false));
 window.addEventListener("keydown", (event) => {{
   if (event.key === "Escape") setMenu(false);
 }});
 document.querySelectorAll(".window-button").forEach(button => button.addEventListener("click", () => {{
   selectedWindowMs = Number(button.dataset.window);
-  document.querySelectorAll(".window-button").forEach(item => item.classList.toggle("active", item === button));
+  document.querySelectorAll(".window-button").forEach(item => {{
+    const isActive = item === button;
+    item.classList.toggle("active", isActive);
+    item.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }});
   if (latestData) render(latestData);
 }}));
 async function refresh() {{
