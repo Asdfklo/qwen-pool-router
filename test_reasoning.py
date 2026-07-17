@@ -191,3 +191,79 @@ def test_old_config_and_optional_backend_routes() -> None:
     assert reasoning_backend_filter(routed, "none") == ({"off"}, False)
     assert reasoning_backend_filter(routed, "high") == ({"high"}, False)
     assert reasoning_backend_filter(routed, "medium") == (None, True)
+
+
+def test_completions_prompt_processing() -> None:
+    from hermes_router import (
+        _extract_prompt_text_from_payload,
+        estimate_prompt_tokens,
+        append_text_to_last_user_message,
+    )
+
+    # 1. Test _extract_prompt_text_from_payload
+    assert _extract_prompt_text_from_payload({"prompt": "Hello"}) == "Hello"
+    assert _extract_prompt_text_from_payload({"prompt": ["Hello", "World"]}) == "Hello World"
+    assert _extract_prompt_text_from_payload({"prompt": ["Hello", 123, {"text": "Obj"}]}) == "Hello <token_id_123> Obj"
+    assert _extract_prompt_text_from_payload({"prompt": {"text": "Object prompt"}}) == "Object prompt"
+    assert _extract_prompt_text_from_payload({}) == ""
+
+    # 2. Test estimate_prompt_tokens on completions prompt
+    assert estimate_prompt_tokens({"prompt": "A" * 100}) == 25
+
+    # 3. Test append_text_to_last_user_message on completions prompt
+    res1 = append_text_to_last_user_message({"prompt": "Hello"}, " /think")
+    assert res1["prompt"] == "Hello /think"
+
+    res2 = append_text_to_last_user_message({"prompt": ["Hello", "World"]}, " /think")
+    assert res2["prompt"] == ["Hello", "World /think"]
+
+
+def test_llama_health_caching_and_parallelization() -> None:
+    import asyncio
+    import time
+    from hermes_router import BackendState, BackendConfig, llama_healthy, choose_backend, RouterState
+    import httpx
+
+    config = RouterConfig.model_validate({
+        "backends": [
+            {"name": "b1", "api_base": "http://127.0.0.1:9091/v1"},
+            {"name": "b2", "api_base": "http://127.0.0.1:9092/v1"}
+        ]
+    })
+    state = RouterState(config)
+    b1 = state.backends[0]
+    b1.last_watchdog_status = {"ready": True}
+    b2 = state.backends[1]
+    b2.last_watchdog_status = {"ready": True}
+
+    call_count = 0
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"status": "ok"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mock_handler)) as client:
+            # First health check (no cache)
+            res1 = await llama_healthy(client, b1, cache_seconds=5.0)
+            assert res1 is True
+            assert call_count == 1
+
+            # Second health check (cached)
+            res2 = await llama_healthy(client, b1, cache_seconds=5.0)
+            assert res2 is True
+            assert call_count == 1  # Should not increase
+
+            # Choose backend parallel check should use cache as well
+            res_choose = await choose_backend(
+                client=client,
+                state=state,
+                payload={"prompt": "test"},
+                request_id=1
+            )
+            assert res_choose is not None
+            # b1 is cached, but b2 needs check
+            assert call_count == 2
+
+    asyncio.run(run())

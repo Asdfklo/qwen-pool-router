@@ -448,6 +448,8 @@ class BackendState:
     latency_ms_average: float = 0.0
     last_watchdog_status: dict[str, Any] | None = None
     last_health_checked: float = 0.0
+    last_llama_healthy: bool | None = None
+    last_llama_healthy_checked: float = 0.0
     last_reject_reason: str = ""
     prompt_tokens_per_sec: float = 0.0
     generated_tokens_per_sec: float = 0.0
@@ -858,7 +860,14 @@ class SessionAffinity:
             return hashlib.sha256(f"session:{explicit_key}".encode("utf-8")).hexdigest()[:16]
         messages = payload.get("messages", [])
         if not messages:
-            return None
+            # Try completions "prompt" instead
+            prompt_text = _extract_prompt_text_from_payload(payload)
+            if not prompt_text:
+                return None
+            token_budget = 200  # ~200 tokens ≈ 800 chars
+            char_budget = token_budget * 4
+            raw = f"completions:{prompt_text[:char_budget]}"
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
         # Take system prompt + first user message as the stable prefix
         prefix_parts = []
         token_budget = 200  # ~200 tokens ≈ 800 chars
@@ -1234,12 +1243,18 @@ async def fetch_watchdog(client: httpx.AsyncClient, backend: BackendState, cache
     return status
 
 
-async def llama_healthy(client: httpx.AsyncClient, backend: BackendState) -> bool:
+async def llama_healthy(client: httpx.AsyncClient, backend: BackendState, cache_seconds: float = 0.0) -> bool:
+    now = time.time()
+    if backend.last_llama_healthy is not None and now - backend.last_llama_healthy_checked < cache_seconds:
+        return backend.last_llama_healthy
     try:
         resp = await client.get(llama_health_url(backend.config.api_base))
-        return resp.status_code < 500
+        is_healthy = resp.status_code < 500
     except Exception:
-        return False
+        is_healthy = False
+    backend.last_llama_healthy = is_healthy
+    backend.last_llama_healthy_checked = now
+    return is_healthy
 
 
 async def fetch_llama_metrics(client: httpx.AsyncClient, api_base: str) -> tuple[float, float]:
@@ -1279,8 +1294,34 @@ def recent_error_penalty(backend: BackendState) -> float:
     return float(len(backend.recent_errors) * 500)
 
 
+def _extract_prompt_text_from_payload(payload: dict[str, Any]) -> str:
+    """Helper to extract a single stable text string from prompt payload key."""
+    prompt = payload.get("prompt")
+    if prompt is None:
+        return ""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        parts = []
+        for p in prompt:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, int):
+                # Token ID - map to placeholder
+                parts.append(f"<token_id_{p}>")
+            elif isinstance(p, dict) and "text" in p:
+                parts.append(str(p["text"]))
+        return " ".join(parts)
+    if isinstance(prompt, dict) and "text" in prompt:
+        return str(prompt["text"])
+    return str(prompt)
+
+
 def estimate_prompt_tokens(payload: dict[str, Any]) -> int:
-    text = json.dumps(payload.get("messages", []), ensure_ascii=False)
+    if "messages" in payload:
+        text = json.dumps(payload.get("messages", []), ensure_ascii=False)
+    else:
+        text = _extract_prompt_text_from_payload(payload)
     return max(1, len(text) // 4)
 
 
@@ -1338,7 +1379,7 @@ async def rejection_reason(client: httpx.AsyncClient, backend: BackendState, con
     watchdog = await fetch_watchdog(client, backend, config.health_cache_seconds)
     if not watchdog.get("ready", False):
         return str(watchdog.get("reason") or "watchdog_not_ready")
-    if not await llama_healthy(client, backend):
+    if not await llama_healthy(client, backend, cache_seconds=config.health_cache_seconds):
         return "llama_health_failed"
     return None
 
@@ -1389,13 +1430,26 @@ async def choose_backend(
                     structured_log("affinity_miss", backend=pinned_name, reason=reason)
 
         # Phase 2: choose the node with the lowest estimated completion time.
-        choices: list[tuple[float, BackendState]] = []
+        eligible_backends = []
         for backend in state.backends:
             if backend.config.name in exclude:
                 continue
             if allowed_backend_names is not None and backend.config.name not in allowed_backend_names:
                 continue
-            reason = await rejection_reason(client, backend, state.config)
+            eligible_backends.append(backend)
+
+        rejection_reasons = []
+        if eligible_backends:
+            # Evaluate rejection reasons in parallel to minimize latency on hot paths
+            rejection_reasons = await asyncio.gather(
+                *(rejection_reason(client, b, state.config) for b in eligible_backends),
+                return_exceptions=True,
+            )
+
+        choices: list[tuple[float, BackendState]] = []
+        for backend, reason in zip(eligible_backends, rejection_reasons):
+            if isinstance(reason, Exception):
+                reason = f"error:{type(reason).__name__}"
             if reason:
                 backend.last_reject_reason = reason
                 structured_log("rejected_backend", backend=backend.config.name, reason=reason)
@@ -1535,15 +1589,21 @@ def router_snapshot(state: RouterState, config: RouterConfig) -> dict[str, Any]:
 
 
 async def refresh_backend_statuses(client: httpx.AsyncClient, state: RouterState, config: RouterConfig) -> None:
-    for backend in state.backends:
-        await fetch_watchdog(client, backend, config.health_cache_seconds)
-        prompt, predicted = await fetch_llama_metrics(client, backend.config.api_base)
-        backend.prompt_tokens_per_sec = prompt
-        backend.generated_tokens_per_sec = predicted
+    async def refresh_single(backend: BackendState) -> None:
+        try:
+            await fetch_watchdog(client, backend, config.health_cache_seconds)
+            prompt, predicted = await fetch_llama_metrics(client, backend.config.api_base)
+            backend.prompt_tokens_per_sec = prompt
+            backend.generated_tokens_per_sec = predicted
+        except Exception as exc:
+            structured_log("refresh_backend_status_failed", backend=backend.config.name, error=type(exc).__name__)
         async with state._lock:
             if reap_stale_active_leases(backend, config):
                 state.telemetry_dirty = True
                 state.status_revision += 1
+
+    if state.backends:
+        await asyncio.gather(*(refresh_single(b) for b in state.backends), return_exceptions=True)
 
 
 def semantic_canary_payload(backend: BackendState, config: SemanticHealthConfig, *, tool_check: bool) -> dict[str, Any]:
@@ -2402,17 +2462,20 @@ def content_to_text(content: Any) -> str:
 
 
 def message_text_for_classification(payload: dict[str, Any], max_chars: int) -> str:
-    messages = payload.get("messages") or []
-    lines: list[str] = []
-    if isinstance(messages, list):
-        for message in messages[-8:]:
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role") or "unknown")
-            text = content_to_text(message.get("content"))
-            if text:
-                lines.append(f"{role}: {text}")
-    text = "\n\n".join(lines)
+    messages = payload.get("messages")
+    if messages is not None:
+        lines: list[str] = []
+        if isinstance(messages, list):
+            for message in messages[-8:]:
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "unknown")
+                text = content_to_text(message.get("content"))
+                if text:
+                    lines.append(f"{role}: {text}")
+        text = "\n\n".join(lines)
+    else:
+        text = _extract_prompt_text_from_payload(payload)
     if len(text) > max_chars:
         return text[-max_chars:]
     return text
@@ -2453,12 +2516,15 @@ _NO_THINK_PATTERNS = [
 
 
 def keyword_thinking_decision(payload: dict[str, Any], config: DynamicThinkingConfig) -> tuple[bool | None, str]:
-    messages = payload.get("messages") or []
-    text = ""
-    for message in reversed(messages):
-        if isinstance(message, dict) and message.get("role") == "user":
-            text = content_to_text(message.get("content")).strip().lower()
-            break
+    messages = payload.get("messages")
+    if messages is not None:
+        text = ""
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                text = content_to_text(message.get("content")).strip().lower()
+                break
+    else:
+        text = _extract_prompt_text_from_payload(payload).strip().lower()
     if re.search(r"(?:^|\s)/(?:no_think|nothink)\b", text):
         return False, "explicit_no_think"
     if re.search(r"(?:^|\s)/think\b", text):
@@ -2508,23 +2574,43 @@ def reasoning_backend_filter(config: RouterConfig, effort: str | None) -> tuple[
 
 def append_text_to_last_user_message(payload: dict[str, Any], suffix: str) -> dict[str, Any]:
     out = dict(payload)
-    messages = list(out.get("messages") or [])
-    out["messages"] = messages
-    for idx in range(len(messages) - 1, -1, -1):
-        message = messages[idx]
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        updated = dict(message)
-        content = updated.get("content")
-        if isinstance(content, str):
-            updated["content"] = content.rstrip() + suffix
-        elif isinstance(content, list):
-            updated["content"] = list(content) + [{"type": "text", "text": suffix.strip()}]
+    if "messages" in out:
+        messages = list(out.get("messages") or [])
+        out["messages"] = messages
+        for idx in range(len(messages) - 1, -1, -1):
+            message = messages[idx]
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            updated = dict(message)
+            content = updated.get("content")
+            if isinstance(content, str):
+                updated["content"] = content.rstrip() + suffix
+            elif isinstance(content, list):
+                updated["content"] = list(content) + [{"type": "text", "text": suffix.strip()}]
+            else:
+                updated["content"] = suffix.strip()
+            messages[idx] = updated
+            return out
+        messages.append({"role": "user", "content": suffix.strip()})
+    else:
+        prompt = out.get("prompt")
+        if isinstance(prompt, str):
+            out["prompt"] = prompt.rstrip() + suffix
+        elif isinstance(prompt, list):
+            # If list of strings, append to the last string element
+            if prompt and isinstance(prompt[-1], str):
+                new_prompt = list(prompt)
+                new_prompt[-1] = new_prompt[-1].rstrip() + suffix
+                out["prompt"] = new_prompt
+            else:
+                # Fallback to appending a string
+                out["prompt"] = list(prompt) + [suffix.strip()]
+        elif isinstance(prompt, dict) and "text" in prompt:
+            new_prompt = dict(prompt)
+            new_prompt["text"] = str(new_prompt["text"]).rstrip() + suffix
+            out["prompt"] = new_prompt
         else:
-            updated["content"] = suffix.strip()
-        messages[idx] = updated
-        return out
-    messages.append({"role": "user", "content": suffix.strip()})
+            out["prompt"] = suffix.strip()
     return out
 
 
@@ -2707,9 +2793,10 @@ async def forward_non_stream(
     deadline_at: float = float("inf"),
     reasoning_effort: str | None = None,
     reasoning: ReasoningConfig | None = None,
+    endpoint_path: str = "/chat/completions",
 ) -> JSONResponse:
     started = time.perf_counter()
-    url = backend.config.api_base.rstrip("/") + "/chat/completions"
+    url = backend.config.api_base.rstrip("/") + endpoint_path
     try:
         resp = await post_with_disconnect(
             client,
@@ -2854,6 +2941,7 @@ async def forward_stream(
     reasoning_effort: str | None = None,
     reasoning: ReasoningConfig | None = None,
     allowed_backend_names: set[str] | None = None,
+    endpoint_path: str = "/chat/completions",
 ) -> StreamingResponse:
     async def body() -> AsyncIterator[bytes]:
         current: BackendState | None = backend
@@ -2861,7 +2949,7 @@ async def forward_stream(
         current_routing_reason = routing_reason
         excluded: set[str] = set()
         while current is not None:
-            url = current.config.api_base.rstrip("/") + "/chat/completions"
+            url = current.config.api_base.rstrip("/") + endpoint_path
             started = time.perf_counter()
             success = False
             cancelled = False
@@ -2979,7 +3067,7 @@ async def forward_stream(
     return StreamingResponse(body(), media_type="text/event-stream")
 
 
-async def forward_fallback(client: httpx.AsyncClient, state: RouterState, payload: dict[str, Any]) -> JSONResponse | StreamingResponse:
+async def forward_fallback(client: httpx.AsyncClient, state: RouterState, payload: dict[str, Any], endpoint_path: str = "/chat/completions") -> JSONResponse | StreamingResponse:
     fb = state.config.fallback
     if not fb.enabled or not fb.api_base or not fb.model:
         return JSONResponse(
@@ -2990,7 +3078,7 @@ async def forward_fallback(client: httpx.AsyncClient, state: RouterState, payloa
         state.fallback_usage_count += 1
         state.telemetry_dirty = True
     structured_log("fallback_used", fallback=fb.name, count=state.fallback_usage_count)
-    url = fb.api_base.rstrip("/") + "/chat/completions"
+    url = fb.api_base.rstrip("/") + endpoint_path
     payload = rewrite_payload(payload, fb.model)
     headers = auth_headers(fb.api_key)
     if payload.get("stream"):
@@ -3051,6 +3139,8 @@ async def apply_config_reload(app: FastAPI, current: RouterConfig, updated: Rout
                 if endpoint_changed or watchdog_changed:
                     backend.last_watchdog_status = None
                     backend.last_health_checked = 0
+                    backend.last_llama_healthy = None
+                    backend.last_llama_healthy_checked = 0
                 if endpoint_changed:
                     backend.semantic_healthy = None
                     backend.semantic_checked_at = 0
@@ -3268,8 +3358,10 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
         )
         return JSONResponse({"ok": True, "registered": backend_config.name, "persisted": bool(config_path)})
 
-    @app.post("/v1/chat/completions", response_model=None)
-    async def chat_completions(request: Request) -> JSONResponse | StreamingResponse:
+    async def _handle_completions_common(
+        request: Request,
+        endpoint_path: str,
+    ) -> JSONResponse | StreamingResponse:
         request_started = time.perf_counter()
         payload = dict(await request.json())
         requested_model = str(payload.get("model") or config.public_model_name)
@@ -3404,6 +3496,7 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                     reasoning_effort=reasoning_resolution.effort,
                     reasoning=config.reasoning,
                     allowed_backend_names=allowed_backend_names,
+                    endpoint_path=endpoint_path,
                 )
             resp = await forward_non_stream(
                 client,
@@ -3423,6 +3516,7 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                 deadline_at=request_deadline_at,
                 reasoning_effort=reasoning_resolution.effort,
                 reasoning=config.reasoning,
+                endpoint_path=endpoint_path,
             )
             if resp.status_code == 599:
                 excluded.add(backend.config.name)
@@ -3440,10 +3534,18 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
             total_ms=(time.perf_counter() - request_started) * 1000,
             routing_reason="unavailable",
         )
-        fallback = await forward_fallback(client, state, payload)
+        fallback = await forward_fallback(client, state, payload, endpoint_path=endpoint_path)
         if fallback.status_code == 503:
             fallback.headers["Retry-After"] = str(config.retry_after_seconds)
         return fallback
+
+    @app.post("/v1/chat/completions", response_model=None)
+    async def chat_completions(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/chat/completions")
+
+    @app.post("/v1/completions", response_model=None)
+    async def completions(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/completions")
 
     return app
 
