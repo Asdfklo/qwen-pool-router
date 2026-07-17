@@ -59,7 +59,7 @@ def _get_cpu_ram_info() -> dict[str, Any]:
             "memory_total_mb": int(mem.total // (1024 * 1024)),
             "memory_used_mb": int(mem.used // (1024 * 1024)),
             "memory_used_percent": round(mem.percent, 1),
-            "utilization_percent": round(mem.percent, 1),
+            "utilization_percent": round(psutil.cpu_percent(interval=None), 1),
             "temperature_c": None,
             "swap_total_mb": int(swap.total // (1024 * 1024)),
             "swap_used_mb": int(swap.used // (1024 * 1024)),
@@ -1711,7 +1711,7 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
     # Determine hardware type
     hw = cfg.hardware if cfg.hardware != "auto" else ("cpu" if not gpu else "gpu")
     if hw == "cpu":
-        gpu = _get_cpu_ram_info() if not gpu else gpu
+        gpu = _get_cpu_ram_info()
     now = time.time()
     active_ages = [max(0.0, now - started_at) for started_at in backend.active_leases.values()]
     return {
