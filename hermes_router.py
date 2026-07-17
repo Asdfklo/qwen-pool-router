@@ -2412,8 +2412,8 @@ function render(data) {{
     const isCpu = b.hardware_type === "cpu";
     const gpuUsed = pct(b.gpu && b.gpu.memory_used_percent);
     const gpuUtil = pct(b.gpu && b.gpu.utilization_percent);
-    const gpuTemp = b.gpu && b.gpu.temperature_c != null ? `${b.gpu.temperature_c}°C` : "n/a";
-    const gpuMem = b.gpu && b.gpu.memory_used_mb != null ? `${gb(b.gpu.memory_used_mb)} / ${gb(b.gpu.memory_total_mb)}` : "n/a";
+    const gpuTemp = (b.gpu && b.gpu.temperature_c != null) ? (b.gpu.temperature_c + " C") : "n/a";
+    const gpuMem = (b.gpu && b.gpu.memory_used_mb != null) ? (gb(b.gpu.memory_used_mb) + " / " + gb(b.gpu.memory_total_mb)) : "n/a";
     const memLabel = isCpu ? "RAM" : "VRAM";
     const promptTps = b.prompt_tokens_per_sec > 0 ? b.prompt_tokens_per_sec.toFixed(1) : "n/a";
     const genTps = b.generated_tokens_per_sec > 0 ? b.generated_tokens_per_sec.toFixed(1) : "n/a";

@@ -236,3 +236,14 @@ def test_vision_no_capable_backend_returns_400():
         })
         assert res.status_code == 400
         assert res.json() == {"error": "model does not support vision"}
+
+
+def test_dashboard_html_renders_with_cpu_backend():
+    """Regression: dashboard must render without NameError when CPU backends present."""
+    from hermes_router import dashboard_html
+    html = dashboard_html("test")
+    assert isinstance(html, str)
+    assert len(html) > 1000
+    # CPU backend shows RAM, GPU shows VRAM in the JS label logic
+    assert "RAM" in html
+    assert "VRAM" in html
