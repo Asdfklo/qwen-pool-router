@@ -290,3 +290,19 @@ def test_resolve_backend_gpu_remote_returns_none():
     gpus, pid_map = _parse_nvidia_smi()
     result = _resolve_backend_gpu("http://192.168.1.50:8080/v1", gpus, pid_map)
     assert result is None
+
+
+def test_cpu_backend_reports_cpu_model():
+    """CPU backends should report the host CPU model name, not n/a."""
+    from hermes_router import _get_cpu_ram_info, _get_cpu_model_name
+    info = _get_cpu_ram_info()
+    assert info.get("cpu_model"), "cpu_model missing"
+    assert _get_cpu_model_name(), "cpu model name detection failed"
+    # snapshot should carry it through
+    from hermes_router import BackendConfig, BackendState, backend_snapshot
+    cfg = BackendConfig(name="cpu-test", api_base="http://127.0.0.1:1/v1",
+                        backend_model="x", hardware="cpu")
+    state = BackendState(config=cfg)
+    snap = backend_snapshot(state)
+    assert snap["hardware_type"] == "cpu"
+    assert snap.get("cpu_model"), "snapshot missing cpu_model"

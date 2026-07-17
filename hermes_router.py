@@ -49,6 +49,21 @@ def expand_env(value: Any) -> Any:
     return value
 
 
+def _get_cpu_model_name() -> str:
+    """Best-effort detection of the host CPU model name (Linux)."""
+    try:
+        import platform
+        # Try /proc/cpuinfo first (most reliable on Linux)
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+        # Fallback to platform
+        return platform.processor() or platform.machine()
+    except (OSError, IndexError):
+        return "Unknown CPU"
+
+
 def _get_cpu_ram_info() -> dict[str, Any]:
     # Return system RAM stats for CPU-only backends.
     try:
@@ -56,6 +71,7 @@ def _get_cpu_ram_info() -> dict[str, Any]:
         mem = psutil.virtual_memory()
         swap = psutil.swap_memory()
         return {
+            "cpu_model": _get_cpu_model_name(),
             "memory_total_mb": int(mem.total // (1024 * 1024)),
             "memory_used_mb": int(mem.used // (1024 * 1024)),
             "memory_used_percent": round(mem.percent, 1),
@@ -1940,6 +1956,7 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
         "process_matches": watchdog.get("process_matches") or [],
         "gpu": gpu,
         "gpu_name": gpu.get("name") if isinstance(gpu, dict) else None,
+        "cpu_model": gpu.get("cpu_model") if isinstance(gpu, dict) else None,
         "hardware_type": hw,
         "llama": llama,
         "watchdog_checked_at": watchdog.get("checked_at"),
@@ -2411,7 +2428,7 @@ def dashboard_html(title: str) -> str:
       <div class="card">
       <div class="cardhead"><h3>Node Targets</h3><span class="muted mono">watchdog + llama health</span></div>
       <table>
-        <thead><tr><th>Status</th><th>Target</th><th>Model</th><th>Context</th><th>Slots</th><th>Requests</th><th>Memory</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>Last Route</th></tr></thead>
+        <thead><tr><th>Status</th><th>Target</th><th>Model</th><th>Context</th><th>Slots</th><th>Requests</th><th>Device &amp; Util</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>Last Route</th></tr></thead>
         <tbody id="backendRows"></tbody>
       </table>
     </div>
@@ -2614,7 +2631,9 @@ function render(data) {{
     const gpuTemp = (b.gpu && b.gpu.temperature_c != null) ? (b.gpu.temperature_c + " C") : "n/a";
     const gpuMem = (b.gpu && b.gpu.memory_used_mb != null) ? (gb(b.gpu.memory_used_mb) + " / " + gb(b.gpu.memory_total_mb)) : "n/a";
     const memLabel = isCpu ? "RAM" : "VRAM";
-    const gpuName = (b.gpu && b.gpu.name) ? b.gpu.name : (b.gpu_name || "n/a");
+    const gpuName = isCpu
+      ? (b.cpu_model || "CPU")
+      : (b.gpu && b.gpu.name ? b.gpu.name : (b.gpu_name || "n/a"));
     const promptTps = b.prompt_tokens_per_sec > 0 ? b.prompt_tokens_per_sec.toFixed(1) : "n/a";
     const genTps = b.generated_tokens_per_sec > 0 ? b.generated_tokens_per_sec.toFixed(1) : "n/a";
     const semanticText = b.semantic_healthy == null
@@ -2642,9 +2661,9 @@ function render(data) {{
       <td><strong>${{fmt.format(nodeRoutes.length)}}</strong><div class="muted">${{nodeSuccess}} ok · ${{nodeFailed}} failed</div></td>
       <td><div class="node-gauges">
         <div><div class="gauge-label">${{memLabel}}</div><div class="gauge-value">${{gpuMem}}</div><div class="bar"><div class="fill" style="width:${{gpuUsed}}%"></div></div></div>
-        <div class="muted mono" style="font-size:0.7rem;margin-top:2px">${{esc(gpuName)}}</div>
-        <div><div class="gauge-label">${{isCpu ? "RAM Load" : "Util"}}</div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div>
-        ${{isCpu ? "" : `<div><div class="gauge-label">Temp</div><div class="gauge-value">${{gpuTemp}}</div></div>`}}
+        <div class="muted mono" style="font-size:0.7rem;margin-top:4px"><strong>Device:</strong> ${{esc(gpuName)}}</div>
+        <div style="margin-top:4px"><div class="gauge-label">Util</div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div>
+        ${{isCpu ? "" : `<div style="margin-top:4px"><div class="gauge-label">Temp</div><div class="gauge-value">${{gpuTemp}}</div></div>`}}
       </div></td>
       <td><div class="mono">${{promptTps}}</div></td>
       <td><div class="mono">${{genTps}}</div></td>
