@@ -1295,7 +1295,33 @@ def recent_error_penalty(backend: BackendState) -> float:
 
 
 def _extract_prompt_text_from_payload(payload: dict[str, Any]) -> str:
-    """Helper to extract a single stable text string from prompt payload key."""
+    """Helper to extract a single stable text string from prompt/input/suffix payload keys."""
+    # Check 'input' for /v1/responses or /infill
+    if "input" in payload:
+        inp = payload["input"]
+        inp_str = ""
+        if isinstance(inp, str):
+            inp_str = inp
+        elif isinstance(inp, list):
+            parts = []
+            for p in inp:
+                if isinstance(p, str):
+                    parts.append(p)
+                elif isinstance(p, int):
+                    parts.append(f"<token_id_{p}>")
+                elif isinstance(p, dict) and "text" in p:
+                    parts.append(str(p["text"]))
+            inp_str = " ".join(parts)
+        elif isinstance(inp, dict) and "text" in inp:
+            inp_str = str(inp["text"])
+        else:
+            inp_str = str(inp)
+
+        suffix = payload.get("suffix", "")
+        if isinstance(suffix, str) and suffix:
+            inp_str += " " + suffix
+        return inp_str
+
     prompt = payload.get("prompt")
     if prompt is None:
         return ""
@@ -2694,6 +2720,7 @@ def rewrite_payload(
     dynamic_thinking: DynamicThinkingConfig | None = None,
     reasoning_effort: str | None = None,
     reasoning: ReasoningConfig | None = None,
+    user_budget: int | None = None,
 ) -> dict[str, Any]:
     out = (
         strip_client_reasoning_fields(payload)
@@ -2705,7 +2732,16 @@ def rewrite_payload(
         stream_options = dict(out.get("stream_options") or {})
         stream_options["include_usage"] = True
         out["stream_options"] = stream_options
-    if reasoning_effort is not None:
+
+    if user_budget is not None:
+        out = apply_thinking_control(
+            out,
+            user_budget > 0,
+            dynamic_thinking,
+            reasoning_budget=user_budget,
+            force_reasoning_budget=True,
+        )
+    elif reasoning_effort is not None:
         budget = reasoning.effort_budgets.get(reasoning_effort) if reasoning else None
         out = apply_thinking_control(
             out,
@@ -2794,9 +2830,10 @@ async def forward_non_stream(
     reasoning_effort: str | None = None,
     reasoning: ReasoningConfig | None = None,
     endpoint_path: str = "/chat/completions",
+    user_budget: int | None = None,
 ) -> JSONResponse:
     started = time.perf_counter()
-    url = backend.config.api_base.rstrip("/") + endpoint_path
+    url = _build_upstream_url(backend.config.api_base, endpoint_path)
     try:
         resp = await post_with_disconnect(
             client,
@@ -2809,6 +2846,7 @@ async def forward_non_stream(
                 dynamic_thinking,
                 reasoning_effort,
                 reasoning,
+                user_budget=user_budget,
             ),
             deadline_at,
         )
@@ -2942,6 +2980,7 @@ async def forward_stream(
     reasoning: ReasoningConfig | None = None,
     allowed_backend_names: set[str] | None = None,
     endpoint_path: str = "/chat/completions",
+    user_budget: int | None = None,
 ) -> StreamingResponse:
     async def body() -> AsyncIterator[bytes]:
         current: BackendState | None = backend
@@ -2949,7 +2988,7 @@ async def forward_stream(
         current_routing_reason = routing_reason
         excluded: set[str] = set()
         while current is not None:
-            url = current.config.api_base.rstrip("/") + endpoint_path
+            url = _build_upstream_url(current.config.api_base, endpoint_path)
             started = time.perf_counter()
             success = False
             cancelled = False
@@ -2968,6 +3007,7 @@ async def forward_stream(
                         dynamic_thinking,
                         reasoning_effort,
                         reasoning,
+                        user_budget=user_budget,
                     ),
                 ) as resp:
                     if resp.status_code >= 500:
@@ -3205,6 +3245,178 @@ async def config_reload_loop(app: FastAPI, config_path: str, current: RouterConf
         await reload_config_from_disk(app, config_path, current)
 
 
+def _build_upstream_url(api_base: str, endpoint_path: str) -> str:
+    base = api_base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3].rstrip("/")
+    return base + endpoint_path
+
+
+async def _handle_proxy_common(request: Request, endpoint_path: str) -> JSONResponse:
+    app = request.app
+    state: RouterState = app.state.router_state
+    client: httpx.AsyncClient = app.state.http
+
+    target_backend = None
+    for backend in state.backends:
+        if backend.config.enabled and not backend.draining and backend.circuit_state != "open":
+            watchdog = backend.last_watchdog_status or {}
+            if watchdog.get("ready", False):
+                target_backend = backend
+                break
+    if not target_backend:
+        for backend in state.backends:
+            if backend.config.enabled:
+                target_backend = backend
+                break
+    if not target_backend:
+        return JSONResponse({"error": "No healthy backends available"}, status_code=503)
+
+    url = _build_upstream_url(target_backend.config.api_base, endpoint_path)
+    body = await request.body()
+    headers = dict(request.headers)
+    headers.pop("host", None)
+
+    try:
+        resp = await client.request(
+            method=request.method,
+            url=url,
+            content=body,
+            headers=headers,
+            params=dict(request.query_params),
+        )
+        try:
+            return JSONResponse(resp.json(), status_code=resp.status_code)
+        except Exception:
+            return JSONResponse({"error": resp.text}, status_code=resp.status_code)
+    except Exception as exc:
+        return JSONResponse({"error": f"Failed to connect to backend: {exc}"}, status_code=502)
+
+
+async def _handle_infill_common(request: Request) -> JSONResponse | StreamingResponse:
+    app = request.app
+    config = app.state.config
+    request_started = time.perf_counter()
+    payload = dict(await request.json())
+    requested_model = str(payload.get("model") or config.public_model_name)
+    payload["model"] = requested_model
+
+    state: RouterState = app.state.router_state
+    client: httpx.AsyncClient = app.state.http
+    priority_name = request.headers.get("x-nyx-priority", "normal").strip().lower()
+    priority = {"low": 1, "normal": 5, "high": 9}.get(priority_name, 5)
+    with suppress(ValueError):
+        priority = max(0, min(9, int(priority_name)))
+    timeout_ms = request.headers.get("x-request-timeout-ms", "")
+    request_timeout = config.request_deadline_seconds
+    with suppress(ValueError):
+        request_timeout = min(request_timeout, max(0.1, float(timeout_ms) / 1000))
+    request_deadline_at = time.time() + request_timeout
+    deadline = min(time.time() + config.max_queue_seconds, request_deadline_at)
+    affinity_key = (
+        request.headers.get("x-hermes-session-id", "")
+        or request.headers.get("x-session-id", "")
+        or str(payload.get("user") or "")
+    )
+    request_id = await state.mark_request_started(
+        stream=bool(payload.get("stream")),
+        priority=priority,
+        deadline_at=request_deadline_at,
+    )
+    if request_id is None:
+        return JSONResponse(
+            {"error": {"message": "Router queue is full", "type": "queue_full"}},
+            status_code=429,
+            headers={"Retry-After": str(config.retry_after_seconds)},
+        )
+    excluded: set[str] = set()
+    while time.time() <= deadline or (excluded and len(excluded) < len(state.backends)):
+        if await request.is_disconnected():
+            await state.remove_from_queue(request_id)
+            await state.mark_cancelled()
+            raise asyncio.CancelledError("client disconnected while queued")
+        if not excluded and not await state.can_attempt(request_id):
+            await asyncio.sleep(0.05)
+            continue
+        choice = await choose_backend(
+            client,
+            state,
+            payload,
+            request_id,
+            exclude=excluded,
+            affinity_key=affinity_key,
+        )
+        if choice is None:
+            await asyncio.sleep(0.1)
+            continue
+        backend, lease_id = choice
+        queue_ms = await state.mark_backend_selected(backend, request_id)
+        routing_reason = backend.last_selection_reason
+
+        structured_log(
+            "infill_route",
+            requested_model=requested_model,
+            selected_upstream=backend.config.name,
+            selected_upstream_url=backend.config.api_base,
+            streaming=bool(payload.get("stream")),
+        )
+        if payload.get("stream"):
+            return await forward_stream(
+                client,
+                request,
+                state,
+                backend,
+                lease_id,
+                payload,
+                request_id,
+                request_started,
+                queue_ms,
+                classifier_ms=0.0,
+                routing_reason=routing_reason,
+                thinking_reason="infill",
+                thinking_enabled=False,
+                deadline_at=request_deadline_at,
+                endpoint_path="/infill",
+            )
+        resp = await forward_non_stream(
+            client,
+            request,
+            state,
+            backend,
+            lease_id,
+            payload,
+            request_id,
+            request_started,
+            queue_ms,
+            classifier_ms=0.0,
+            routing_reason=routing_reason,
+            thinking_reason="infill",
+            thinking_enabled=False,
+            deadline_at=request_deadline_at,
+            endpoint_path="/infill",
+        )
+        if resp.status_code == 599:
+            excluded.add(backend.config.name)
+            await state.mark_retry()
+            continue
+        return resp
+    await state.remove_from_queue(request_id)
+    await state.record_route(
+        request_id=request_id,
+        backend_name="none",
+        status="error",
+        stream=bool(payload.get("stream")),
+        error="backend_unavailable",
+        queue_ms=(time.perf_counter() - request_started) * 1000,
+        total_ms=(time.perf_counter() - request_started) * 1000,
+        routing_reason="unavailable",
+    )
+    fallback = await forward_fallback(client, state, payload, endpoint_path="/infill")
+    if fallback.status_code == 503:
+        fallback.headers["Retry-After"] = str(config.retry_after_seconds)
+    return fallback
+
+
 def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
     timeout = httpx.Timeout(
         timeout=config.request_timeout_seconds,
@@ -3300,10 +3512,31 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
-        context_length = max((backend.max_context_tokens for backend in config.backends if backend.enabled), default=262144)
-        model_ids = [config.public_model_name]
-        if config.reasoning.expose_reasoning_models:
-            model_ids.extend(f"{config.public_model_name}:{effort}" for effort in SUPPORTED_EFFORTS)
+        state: RouterState = app.state.router_state
+        connected_models = set()
+        for b in state.backends:
+            if b.config.enabled:
+                connected_models.add(b.config.backend_model)
+        if not connected_models:
+            connected_models.add(config.public_model_name)
+
+        # Collect max context length per backend model
+        model_context_lengths = {}
+        for b in state.backends:
+            if b.config.enabled:
+                m = b.config.backend_model
+                model_context_lengths[m] = max(model_context_lengths.get(m, 0), b.config.max_context_tokens)
+
+        # Build dynamic list of models
+        model_ids = []
+        for model_name in sorted(connected_models):
+            model_ids.append(model_name)
+            if config.reasoning.expose_reasoning_models:
+                for effort in SUPPORTED_EFFORTS:
+                    model_ids.append(f"{model_name}:{effort}")
+
+        default_ctx = max((backend.max_context_tokens for backend in config.backends if backend.enabled), default=262144)
+
         return {
             "object": "list",
             "data": [
@@ -3311,7 +3544,7 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                     "id": model_id,
                     "object": "model",
                     "owned_by": "hermes-qwen-pool",
-                    "context_length": context_length,
+                    "context_length": model_context_lengths.get(model_id.partition(":")[0], default_ctx),
                 }
                 for model_id in model_ids
             ],
@@ -3374,6 +3607,21 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
             global_default=config.reasoning.default_effort,
         )
         payload["model"] = reasoning_resolution.base_model
+
+        # Extract user dictated budget if any
+        user_budget = None
+        for k in ("reasoning_budget", "thinking_budget", "max_thinking_tokens", "max_reasoning_tokens"):
+            if k in payload:
+                with suppress(ValueError, TypeError):
+                    user_budget = int(payload[k])
+                    break
+        for h in ("x-thinking-budget", "x-reasoning-budget"):
+            val = request.headers.get(h)
+            if val:
+                with suppress(ValueError, TypeError):
+                    user_budget = int(val)
+                    break
+
         allowed_backend_names, route_fallback = reasoning_backend_filter(
             config,
             reasoning_resolution.effort,
@@ -3438,24 +3686,48 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
             backend, lease_id = choice
             queue_ms = await state.mark_backend_selected(backend, request_id)
             routing_reason = backend.last_selection_reason
+            is_reasoning_endpoint = endpoint_path in (
+                "/v1/chat/completions",
+                "/chat/completions",
+                "/v1/completions",
+                "/completions",
+                "/completion",
+            )
             classifier_started = time.perf_counter()
-            if reasoning_resolution.effort is not None:
-                thinking_enabled = reasoning_resolution.effort != "none"
-                classifier_used = False
-                thinking_reason = (
-                    f"reasoning_effort:{reasoning_resolution.effort}:"
-                    f"{reasoning_resolution.source}"
-                )
+            if is_reasoning_endpoint:
+                if user_budget is not None:
+                    thinking_enabled = user_budget > 0
+                    classifier_used = False
+                    thinking_reason = f"user_dictated_budget:{user_budget}"
+                elif reasoning_resolution.effort is not None:
+                    thinking_enabled = reasoning_resolution.effort != "none"
+                    classifier_used = False
+                    thinking_reason = (
+                        f"reasoning_effort:{reasoning_resolution.effort}:"
+                        f"{reasoning_resolution.source}"
+                    )
+                else:
+                    thinking_enabled, classifier_used, thinking_reason = await decide_thinking(
+                        client,
+                        backend,
+                        payload,
+                        config.dynamic_thinking,
+                        classifier_cache=state.classifier_cache,
+                    )
+                classifier_ms = (time.perf_counter() - classifier_started) * 1000
+                await state.record_thinking_decision(enabled=thinking_enabled, classifier_used=classifier_used)
             else:
-                thinking_enabled, classifier_used, thinking_reason = await decide_thinking(
-                    client,
-                    backend,
-                    payload,
-                    config.dynamic_thinking,
-                    classifier_cache=state.classifier_cache,
-                )
-            classifier_ms = (time.perf_counter() - classifier_started) * 1000
-            await state.record_thinking_decision(enabled=thinking_enabled, classifier_used=classifier_used)
+                thinking_enabled = False
+                classifier_used = False
+                thinking_reason = "endpoint_unsupported"
+                classifier_ms = 0.0
+
+            forward_reasoning_effort = (
+                reasoning_resolution.effort
+                if (is_reasoning_endpoint and user_budget is None)
+                else None
+            )
+
             structured_log(
                 "thinking_decision",
                 backend=backend.config.name,
@@ -3493,10 +3765,11 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                     dynamic_thinking=config.dynamic_thinking,
                     affinity_key=affinity_key,
                     deadline_at=request_deadline_at,
-                    reasoning_effort=reasoning_resolution.effort,
+                    reasoning_effort=forward_reasoning_effort,
                     reasoning=config.reasoning,
                     allowed_backend_names=allowed_backend_names,
                     endpoint_path=endpoint_path,
+                    user_budget=user_budget,
                 )
             resp = await forward_non_stream(
                 client,
@@ -3514,9 +3787,10 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                 thinking_enabled=thinking_enabled,
                 dynamic_thinking=config.dynamic_thinking,
                 deadline_at=request_deadline_at,
-                reasoning_effort=reasoning_resolution.effort,
+                reasoning_effort=forward_reasoning_effort,
                 reasoning=config.reasoning,
                 endpoint_path=endpoint_path,
+                user_budget=user_budget,
             )
             if resp.status_code == 599:
                 excluded.add(backend.config.name)
@@ -3541,11 +3815,102 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/v1/chat/completions")
+
+    @app.post("/chat/completions", response_model=None)
+    async def chat_completions_legacy(request: Request) -> JSONResponse | StreamingResponse:
         return await _handle_completions_common(request, "/chat/completions")
 
     @app.post("/v1/completions", response_model=None)
     async def completions(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/v1/completions")
+
+    @app.post("/completions", response_model=None)
+    async def completions_legacy(request: Request) -> JSONResponse | StreamingResponse:
         return await _handle_completions_common(request, "/completions")
+
+    @app.post("/completion", response_model=None)
+    async def completion_legacy(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/completion")
+
+    @app.post("/v1/responses", response_model=None)
+    async def responses(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/v1/responses")
+
+    @app.post("/responses", response_model=None)
+    async def responses_legacy(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_completions_common(request, "/responses")
+
+    # Simple Proxy Endpoints (Tier 2 & Tier 3 /embeddings/rerank/etc)
+    @app.post("/tokenize")
+    async def tokenize(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/tokenize")
+
+    @app.post("/detokenize")
+    async def detokenize(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/detokenize")
+
+    @app.post("/apply-template")
+    async def apply_template(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/apply-template")
+
+    @app.post("/v1/chat/completions/input_tokens")
+    async def chat_input_tokens(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/chat/completions/input_tokens")
+
+    @app.post("/v1/responses/input_tokens")
+    async def responses_input_tokens(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/responses/input_tokens")
+
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/messages/count_tokens")
+
+    @app.post("/v1/embeddings", response_model=None)
+    async def embeddings(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/embeddings")
+
+    @app.post("/embeddings", response_model=None)
+    async def embeddings_legacy(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/embeddings")
+
+    @app.post("/embedding", response_model=None)
+    async def embedding_legacy(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/embedding")
+
+    @app.post("/v1/rerank", response_model=None)
+    async def rerank(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/rerank")
+
+    @app.post("/rerank", response_model=None)
+    async def rerank_legacy(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/rerank")
+
+    @app.post("/reranking", response_model=None)
+    async def reranking_legacy(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/reranking")
+
+    @app.post("/v1/reranking", response_model=None)
+    async def reranking_legacy_v1(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/reranking")
+
+    @app.post("/v1/audio/transcriptions", response_model=None)
+    async def audio_transcriptions(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/v1/audio/transcriptions")
+
+    @app.post("/audio/transcriptions", response_model=None)
+    async def audio_transcriptions_legacy(request: Request) -> JSONResponse:
+        return await _handle_proxy_common(request, "/audio/transcriptions")
+
+    # Code infill
+    @app.post("/infill", response_model=None)
+    async def infill(request: Request) -> JSONResponse | StreamingResponse:
+        return await _handle_infill_common(request)
+
+    # Catch-all dynamic proxy route for all other endpoints
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
+    async def catch_all(request: Request, path: str):
+        return await _handle_proxy_common(request, "/" + path)
 
     return app
 
