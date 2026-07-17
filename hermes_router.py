@@ -3577,6 +3577,20 @@ async def _handle_infill_common(request: Request) -> JSONResponse | StreamingRes
             headers={"Retry-After": str(config.retry_after_seconds)},
         )
     excluded: set[str] = set()
+    # Fast-fail: no compatible backend for requested model
+    routing_model = str(payload.get("model")) if payload.get("model") else None
+    if routing_model:
+        has_compatible = any(
+            is_backend_compatible(b, routing_model, "/infill", False, config.public_model_name)
+            for b in state.backends if b.config.enabled
+        )
+        if not has_compatible:
+            await state.remove_from_queue(request_id)
+            await state.mark_cancelled()
+            return JSONResponse(
+                {"error": {"message": f"Model '{requested_model}' is not available on any backend", "type": "model_not_found"}},
+                status_code=400,
+            )
     while time.time() <= deadline or (excluded and len(excluded) < len(state.backends)):
         if await request.is_disconnected():
             await state.remove_from_queue(request_id)
@@ -3959,6 +3973,20 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                 headers={"Retry-After": str(config.retry_after_seconds)},
             )
         excluded: set[str] = set()
+        # Fast-fail: no compatible backend for requested model
+        if payload.get("model"):
+            routing_model = base_model_for_default
+            has_compatible = any(
+                is_backend_compatible(b, routing_model, endpoint_path, is_vision_request, config.public_model_name)
+                for b in state.backends if b.config.enabled
+            )
+            if not has_compatible:
+                await state.remove_from_queue(request_id)
+                await state.mark_cancelled()
+                return JSONResponse(
+                    {"error": {"message": f"Model '{requested_model}' is not available on any backend", "type": "model_not_found"}},
+                    status_code=400,
+                )
         while time.time() <= deadline or (excluded and len(excluded) < len(state.backends)):
             if await request.is_disconnected():
                 await state.remove_from_queue(request_id)
