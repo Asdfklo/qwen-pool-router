@@ -1,0 +1,76 @@
+public_model_name: qwen-3.6-35b
+listen_host: 0.0.0.0
+listen_port: 4000
+
+request_timeout_seconds: 180
+connect_timeout_seconds: 5
+cooldown_seconds: 60
+max_queue_seconds: 30
+retry_after_seconds: 30
+health_cache_seconds: 3
+admin_token: ''
+
+reasoning:
+  # null preserves keyword and /think auto mode for clients without a variant.
+  default_effort: null
+  strip_client_reasoning_fields: true
+  expose_reasoning_models: true
+  effort_budgets:
+    minimal: 128
+    low: 512
+    medium: 2048
+    high: 8192
+    xhigh: 16384
+  # Optional dedicated-profile routing. Omit this map when every replica can
+  # apply Qwen thinking controls per request.
+  routes: {}
+
+semantic_health:
+  enabled: false
+  interval_seconds: 900
+  initial_delay_seconds: 120
+  idle_seconds: 30
+  timeout_seconds: 20
+  max_tokens: 12
+  expected_response: NYX_OK
+  tool_check_every: 4
+  failure_threshold: 3
+  # Keep report-only until the canary has proven reliable for the model/template.
+  enforce: false
+
+backends:
+  - name: precision-qwen
+    api_base: http://127.0.0.1:8081/v1
+    watchdog_base: http://127.0.0.1:9090
+    backend_model: qwen-3.6-35b
+    max_parallel_requests: 1
+    enabled: false
+    preferred_for_long_context: true
+
+  - name: qwen-node-1
+    api_base: http://qwen-node-1:8081/v1
+    watchdog_base: http://qwen-node-1:9090
+    backend_model: qwen-3.6-35b
+    max_parallel_requests: 1
+    enabled: true
+
+  - name: qwen-node-2
+    api_base: http://qwen-node-2:8081/v1
+    watchdog_base: http://qwen-node-2:9090
+    backend_model: qwen-3.6-35b
+    max_parallel_requests: 1
+    enabled: true
+
+  - name: qwen-node-3
+    api_base: http://qwen-node-3:8081/v1
+    watchdog_base: http://qwen-node-3:9090
+    backend_model: qwen-3.6-35b
+    max_parallel_requests: 1
+    enabled: true
+
+fallback:
+  enabled: true
+  name: fallback
+  model: ${FALLBACK_MODEL_NAME}
+  api_base: ${FALLBACK_API_BASE}
+  api_key: ${FALLBACK_API_KEY}

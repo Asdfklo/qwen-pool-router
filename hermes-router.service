@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes Qwen replica pool router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hermes-qwen-pool
+EnvironmentFile=-/etc/hermes-qwen-pool/router.env
+ExecStart=/opt/hermes-qwen-pool/.venv/bin/python /opt/hermes-qwen-pool/router/hermes_router.py --config /etc/hermes-qwen-pool/router.yaml
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Backups
+*.bak
+*.bak.*
+*.bak-*
+*.backup-*
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment / secrets
+*.env
+.env
+router.yaml
+config.yaml
+
+# OS junk
+.DS_Store
+Thumbs.db
