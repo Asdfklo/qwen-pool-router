@@ -237,3 +237,60 @@ def test_semantic_failure_is_reported_without_opening_circuit() -> None:
         assert backend.circuit_state == "closed"
 
     asyncio.run(run())
+
+
+def test_dynamic_props_detection() -> None:
+    async def run() -> None:
+        config = make_config()
+        state = RouterState(config)
+        backend = state.backends[0]
+        backend.last_props_checked = 0.0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            url_str = str(request.url)
+            if "/props" in url_str:
+                props_payload = {
+                    "default_generation_settings": {
+                        "n_ctx": 4096,
+                    },
+                    "modalities": {
+                        "vision": True,
+                    },
+                    "model_path": "/models/Qwen-7B-Instruct.gguf"
+                }
+                return httpx.Response(200, json=props_payload, request=request)
+            elif "/metrics" in url_str:
+                return httpx.Response(200, text="llamacpp:prompt_tokens_seconds 123.0\nllamacpp:predicted_tokens_seconds 45.0\n", request=request)
+            return httpx.Response(404, request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            from hermes_router import refresh_backend_statuses
+            await refresh_backend_statuses(client, state, config)
+
+        assert backend.max_context_tokens == 4096
+        assert backend.has_vision is True
+        assert backend.backend_model == "Qwen-7B-Instruct"
+        assert backend.last_props_checked > 0.0
+
+    asyncio.run(run())
+
+
+def test_models_endpoint_has_vision_and_context() -> None:
+    config = make_config()
+    from hermes_router import create_app
+    app = create_app(config)
+
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        state = app.state.router_state
+        state.backends[0].max_context_tokens = 8192
+        state.backends[0].has_vision = True
+
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "data" in data
+        model = data["data"][0]
+        assert model["context_length"] == 8192
+        assert model["modalities"]["vision"] is True
+        assert "image" in model["architecture"]["input_modalities"]
