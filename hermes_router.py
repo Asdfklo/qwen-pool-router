@@ -58,6 +58,8 @@ class BackendConfig(BaseModel):
     max_parallel_requests: int = 1
     enabled: bool = True
     preferred_for_long_context: bool = False
+    weight: int = 1
+    allowed_endpoints: list[str] | None = None
 
 
 class FallbackConfig(BaseModel):
@@ -415,6 +417,7 @@ class RouterConfig(BaseModel):
     circuit_failure_threshold: int = 3
     circuit_open_seconds: float = 30
     circuit_probe_interval_seconds: float = 10
+    cache_check_interval_seconds: float = 10.0
     preferred_backend_names: list[str] = Field(default_factory=lambda: ["precision-qwen"])
     admin_token: str = ""
     backends: list[BackendConfig] = Field(default_factory=list)
@@ -518,6 +521,7 @@ class RouterState:
             ttl=config.dynamic_thinking.classifier_cache_ttl_seconds,
             max_entries=config.dynamic_thinking.classifier_cache_max_entries,
         )
+        self.backend_cache_hints: dict[tuple[str, str], tuple[int, float]] = {}
 
     def backend_by_name(self, name: str) -> BackendState | None:
         return next((b for b in self.backends if b.config.name == name), None)
@@ -1440,6 +1444,110 @@ async def rejection_reason(client: httpx.AsyncClient, backend: BackendState, con
     return None
 
 
+def payload_has_images(payload: dict[str, Any]) -> bool:
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "image_url" or "image_url" in item:
+                        return True
+        elif isinstance(content, dict):
+            if content.get("type") == "image_url" or "image_url" in content:
+                return True
+    return False
+
+
+def is_endpoint_allowed(backend_config: BackendConfig, endpoint_path: str) -> bool:
+    if backend_config.allowed_endpoints is None:
+        return True
+    normalized_path = endpoint_path.strip("/")
+    if normalized_path.startswith("v1/"):
+        normalized_path = normalized_path[3:]
+    for allowed in backend_config.allowed_endpoints:
+        allowed_norm = allowed.strip("/")
+        if allowed_norm.startswith("v1/"):
+            allowed_norm = allowed_norm[3:]
+        if allowed_norm == normalized_path:
+            return True
+    return False
+
+
+def is_backend_compatible(
+    backend: BackendState,
+    requested_model: str | None,
+    endpoint_path: str,
+    is_vision_request: bool,
+    public_model_name: str = "",
+) -> bool:
+    if not is_endpoint_allowed(backend.config, endpoint_path):
+        return False
+    if requested_model:
+        req_lower = requested_model.lower()
+        if public_model_name and req_lower == public_model_name.lower():
+            pass
+        else:
+            model_name = (backend.backend_model or "").lower()
+            config_model_name = (backend.config.backend_model or "").lower()
+            # fuzzy match in either direction
+            if (
+                req_lower not in model_name
+                and model_name not in req_lower
+                and req_lower not in config_model_name
+                and config_model_name not in req_lower
+            ):
+                return False
+    if is_vision_request and not backend.has_vision:
+        return False
+    return True
+
+
+async def get_cached_tokens(
+    client: httpx.AsyncClient,
+    state: RouterState,
+    backend: BackendState,
+    prefix_key: str,
+    payload: dict[str, Any],
+    cache_check_interval_seconds: float,
+    endpoint_path: str,
+) -> int:
+    now = time.time()
+    cache_key = (backend.config.name, prefix_key)
+    if cache_key in state.backend_cache_hints:
+        cached_val, ts = state.backend_cache_hints[cache_key]
+        if now - ts < cache_check_interval_seconds:
+            return cached_val
+
+    endpoint = "/v1/chat/completions/input_tokens"
+    if "responses" in endpoint_path:
+        endpoint = "/v1/responses/input_tokens"
+
+    url = _build_upstream_url(backend.config.api_base, endpoint)
+    cached = 0
+    try:
+        resp = await client.post(url, json=payload, timeout=0.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            cached = data.get("cached_tokens") or data.get("tokens") or data.get("input_tokens") or 0
+        elif resp.status_code in (404, 405):
+            slots_url = _build_upstream_url(backend.config.api_base, "/slots")
+            resp_slots = await client.get(slots_url, timeout=0.5)
+            if resp_slots.status_code == 200:
+                slots = resp_slots.json()
+                if isinstance(slots, list):
+                    cached = max((s.get("cache_tokens", 0) for s in slots if isinstance(s, dict)), default=0)
+    except Exception:
+        pass
+
+    state.backend_cache_hints[cache_key] = (cached, now)
+    return cached
+
+
 async def choose_backend(
     client: httpx.AsyncClient,
     state: RouterState,
@@ -1448,11 +1556,14 @@ async def choose_backend(
     exclude: set[str] | None = None,
     affinity_key: str = "",
     allowed_backend_names: set[str] | None = None,
+    requested_model: str | None = None,
+    endpoint_path: str = "/v1/chat/completions",
 ) -> tuple[BackendState, str] | None:
     exclude = exclude or set()
     long_context = estimate_prompt_tokens(payload) >= 32768
     prompt_tokens = estimate_prompt_tokens(payload)
     expected_output_tokens = max(1, int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 512))
+    is_vision_request = payload_has_images(payload)
 
     # --- Phase 1: Try cache affinity (pin to same backend for KV reuse) ---
     pinned_name: str | None = None
@@ -1467,7 +1578,7 @@ async def choose_backend(
             and (allowed_backend_names is None or pinned_name in allowed_backend_names)
         ):
             pinned = state.backend_by_name(pinned_name)
-            if pinned:
+            if pinned and is_backend_compatible(pinned, requested_model, endpoint_path, is_vision_request, state.config.public_model_name):
                 reason = await rejection_reason(client, pinned, state.config)
                 if not reason:
                     pinned.last_reject_reason = ""
@@ -1492,6 +1603,8 @@ async def choose_backend(
                 continue
             if allowed_backend_names is not None and backend.config.name not in allowed_backend_names:
                 continue
+            if not is_backend_compatible(backend, requested_model, endpoint_path, is_vision_request, state.config.public_model_name):
+                continue
             eligible_backends.append(backend)
 
         rejection_reasons = []
@@ -1503,6 +1616,8 @@ async def choose_backend(
             )
 
         choices: list[tuple[float, BackendState]] = []
+        prefix_key = state.affinity._extract_prefix_key(payload, affinity_key)
+
         for backend, reason in zip(eligible_backends, rejection_reasons):
             if isinstance(reason, Exception):
                 reason = f"error:{type(reason).__name__}"
@@ -1521,9 +1636,34 @@ async def choose_backend(
             )
             if backend.config.name in state.config.preferred_backend_names:
                 score += 250.0
+
+            # Weighted manual bias: respect weight
+            score += backend.config.weight * 1000.0
+
+            # Content-aware: prefer non-vision backends for pure text requests
+            if not is_vision_request and not backend.has_vision:
+                score += 1000.0
+
             choices.append((score, backend))
+
         if not choices:
             return None
+
+        # Fetch cached tokens and add score bonus for cache-aware routing
+        if requested_model and prefix_key:
+            # Since we need async get_cached_tokens, let's gather them in parallel for those in choices
+            cached_token_counts = await asyncio.gather(
+                *(get_cached_tokens(client, state, item[1], prefix_key, payload, state.config.cache_check_interval_seconds, endpoint_path) for item in choices),
+                return_exceptions=True
+            )
+            final_choices = []
+            for item, cached_cnt in zip(choices, cached_token_counts):
+                score, backend = item
+                if isinstance(cached_cnt, int) and cached_cnt > 0:
+                    score += cached_cnt * 10.0
+                final_choices.append((score, backend))
+            choices = final_choices
+
         choices.sort(key=lambda item: item[0], reverse=True)
         selected = choices[0][1]
         lease_id = acquire_backend_lease(selected, request_id)
@@ -3308,24 +3448,75 @@ def _build_upstream_url(api_base: str, endpoint_path: str) -> str:
     return base + endpoint_path
 
 
-async def _handle_proxy_common(request: Request, endpoint_path: str) -> JSONResponse:
+def select_proxy_backend(state: RouterState, endpoint_path: str) -> BackendState | None:
+    path = endpoint_path.strip("/")
+    target = ""
+    if "embeddings" in path or "embedding" in path:
+        target = "embed"
+    elif "rerank" in path or "reranking" in path:
+        target = "rerank"
+
+    if not target:
+        return None
+
+    eligible_backends = []
+    for backend in state.backends:
+        if not backend.config.enabled or backend.draining or backend.circuit_state == "open":
+            continue
+
+        model_name = (backend.backend_model or backend.config.backend_model or "").lower()
+        model_match = target in model_name
+
+        endpoint_match = False
+        if backend.config.allowed_endpoints is not None:
+            for allowed in backend.config.allowed_endpoints:
+                allowed_norm = allowed.strip("/")
+                if target in allowed_norm.lower() or allowed_norm.lower() == path:
+                    endpoint_match = True
+                    break
+
+        if model_match or endpoint_match:
+            eligible_backends.append(backend)
+
+    if eligible_backends:
+        eligible_backends.sort(key=lambda b: b.active_requests)
+        return eligible_backends[0]
+
+    return None
+
+
+async def _handle_proxy_common(request: Request, endpoint_path: str) -> JSONResponse | StreamingResponse:
     app = request.app
     state: RouterState = app.state.router_state
     client: httpx.AsyncClient = app.state.http
 
-    target_backend = None
-    for backend in state.backends:
-        if backend.config.enabled and not backend.draining and backend.circuit_state != "open":
-            watchdog = backend.last_watchdog_status or {}
-            if watchdog.get("ready", False):
-                target_backend = backend
-                break
+    # Try model-specific proxy routing first
+    target_backend = select_proxy_backend(state, endpoint_path)
+
+    # Fallback to general healthy backend
+    if not target_backend:
+        for backend in state.backends:
+            if backend.config.enabled and not backend.draining and backend.circuit_state != "open":
+                watchdog = backend.last_watchdog_status or {}
+                if watchdog.get("ready", False):
+                    target_backend = backend
+                    break
+
+    # Fallback to any enabled backend
     if not target_backend:
         for backend in state.backends:
             if backend.config.enabled:
                 target_backend = backend
                 break
+
+    # Fallback to config fallback if defined
     if not target_backend:
+        fb = state.config.fallback
+        if fb.enabled and fb.api_base:
+            payload = {}
+            with suppress(Exception):
+                payload = await request.json()
+            return await forward_fallback(client, state, payload, endpoint_path=endpoint_path)
         return JSONResponse({"error": "No healthy backends available"}, status_code=503)
 
     url = _build_upstream_url(target_backend.config.api_base, endpoint_path)
@@ -3394,6 +3585,8 @@ async def _handle_infill_common(request: Request) -> JSONResponse | StreamingRes
         if not excluded and not await state.can_attempt(request_id):
             await asyncio.sleep(0.05)
             continue
+        explicit_model = payload.get("model")
+        routing_model = str(explicit_model) if explicit_model else None
         choice = await choose_backend(
             client,
             state,
@@ -3401,6 +3594,8 @@ async def _handle_infill_common(request: Request) -> JSONResponse | StreamingRes
             request_id,
             exclude=excluded,
             affinity_key=affinity_key,
+            requested_model=routing_model,
+            endpoint_path="/infill",
         )
         if choice is None:
             await asyncio.sleep(0.1)
@@ -3593,6 +3788,13 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                 for effort in SUPPORTED_EFFORTS:
                     model_ids.append(f"{model_name}:{effort}")
 
+        # Count replicas per base model
+        replicas_count = {}
+        for b in state.backends:
+            if b.config.enabled:
+                m = b.backend_model or b.config.backend_model
+                replicas_count[m] = replicas_count.get(m, 0) + 1
+
         default_ctx = max((b.max_context_tokens or b.config.max_context_tokens for b in state.backends if b.config.enabled), default=262144)
         has_vision = any(b.has_vision for b in state.backends if b.config.enabled)
 
@@ -3604,6 +3806,7 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                     "object": "model",
                     "owned_by": "hermes-qwen-pool",
                     "context_length": model_context_lengths.get(model_id.partition(":")[0], default_ctx),
+                    "replicas": replicas_count.get(model_id.partition(":")[0], 1),
                     "modalities": {"vision": has_vision},
                     "architecture": {
                         "input_modalities": ["text", "image"] if has_vision else ["text"],
@@ -3700,6 +3903,35 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
             )
         state: RouterState = app.state.router_state
         client: httpx.AsyncClient = app.state.http
+
+        # Content-aware vision check
+        is_vision_request = payload_has_images(payload)
+        if is_vision_request:
+            has_any_vision = False
+            for b in state.backends:
+                if b.config.enabled:
+                    model_match = True
+                    explicit_model = payload.get("model")
+                    if explicit_model:
+                        base_model_for_default, _ = parse_model_reasoning_suffix(str(explicit_model))
+                        req_lower = base_model_for_default.lower()
+                        if config.public_model_name and req_lower == config.public_model_name.lower():
+                            pass
+                        else:
+                            model_name = (b.backend_model or "").lower()
+                            config_model_name = (b.config.backend_model or "").lower()
+                            if (
+                                req_lower not in model_name
+                                and model_name not in req_lower
+                                and req_lower not in config_model_name
+                                and config_model_name not in req_lower
+                            ):
+                                model_match = False
+                    if model_match and b.has_vision:
+                        has_any_vision = True
+                        break
+            if not has_any_vision:
+                return JSONResponse({"error": "model does not support vision"}, status_code=400)
         priority_name = request.headers.get("x-nyx-priority", "normal").strip().lower()
         priority = {"low": 1, "normal": 5, "high": 9}.get(priority_name, 5)
         with suppress(ValueError):
@@ -3735,6 +3967,8 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
             if not excluded and not await state.can_attempt(request_id):
                 await asyncio.sleep(0.05)
                 continue
+            explicit_model = payload.get("model")
+            routing_model = base_model_for_default if explicit_model else None
             choice = await choose_backend(
                 client,
                 state,
@@ -3743,6 +3977,8 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                 exclude=excluded,
                 affinity_key=affinity_key,
                 allowed_backend_names=allowed_backend_names,
+                requested_model=routing_model,
+                endpoint_path=endpoint_path,
             )
             if choice is None:
                 await asyncio.sleep(0.1)
@@ -3750,6 +3986,14 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
             backend, lease_id = choice
             queue_ms = await state.mark_backend_selected(backend, request_id)
             routing_reason = backend.last_selection_reason
+
+            structured_log(
+                "model_gateway_routing",
+                requested_model=requested_model,
+                resolved_model=base_model_for_default,
+                selected_backend=backend.config.name,
+                selected_model=backend.backend_model,
+            )
             is_reasoning_endpoint = endpoint_path in (
                 "/v1/chat/completions",
                 "/chat/completions",
