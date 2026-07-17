@@ -2337,6 +2337,9 @@ def dashboard_html(title: str) -> str:
     .route {{ display: grid; grid-template-columns: 86px 1fr auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }}
     .route:last-child {{ border-bottom: 0; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    .model-name {{ white-space: normal; overflow-wrap: anywhere; word-break: break-word; display: block; line-height: 1.35; }}
+    .col-target {{ min-width: 220px; max-width: 220px; width: 220px; }}
+    .col-model {{ min-width: 220px; max-width: 220px; width: 220px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; vertical-align: top; }}
     .empty {{ color: var(--muted); padding: 32px; text-align: center; border: 1px solid var(--line); }}
     .kv {{ display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 0.84rem; }}
     .kv:last-child {{ border-bottom: 0; }}
@@ -2431,7 +2434,7 @@ def dashboard_html(title: str) -> str:
       <div class="cardhead"><h3>Node Targets</h3><span class="muted mono">watchdog + llama health</span></div>
       <div class="scroll-x">
       <table>
-        <thead><tr><th>Status</th><th>Target</th><th>Model</th><th>Context</th><th>Slots</th><th>Requests</th><th>Device &amp; Util</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>Last Route</th></tr></thead>
+        <thead><tr><th>Status</th><th class="col-target">Target</th><th class="col-model">Model</th><th>Context</th><th>Slots</th><th>Requests</th><th>Device &amp; Util</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>Last Route</th></tr></thead>
         <tbody id="backendRows"></tbody>
       </table>
       </div>
@@ -2659,7 +2662,7 @@ function render(data) {{
     return `<tr>
       <td><span class="status ${{statusClass(b)}}">${{esc(statusText(b))}}</span></td>
       <td><strong>${{esc(b.name)}}</strong><div class="muted mono">${{esc(b.watchdog_base || "watchdog=none")}}</div><div class="muted mono">${{esc(b.api_base)}}</div><div class="muted mono">${{semanticText}}</div></td>
-      <td>${{esc(b.backend_model)}}${{b.has_vision ? ' <span style="background:var(--accent);color:var(--accent-foreground);padding:2px 4px;font-size:0.7rem;font-weight:bold;margin-left:6px;border-radius:2px">VISION</span>' : ''}}</td>
+      <td class="col-model"><span class="model-name">${{esc(b.backend_model)}}</span>${{b.has_vision ? ' <span style="background:var(--accent);color:var(--accent-foreground);padding:2px 4px;font-size:0.7rem;font-weight:bold;margin-left:6px;border-radius:2px">VISION</span>' : ''}}</td>
       <td>${{fmt.format(b.max_context_tokens || 0)}}</td>
       <td>${{b.active_requests}}/${{b.max_parallel_requests}}<div class="muted">avg ${{b.latency_ms_average || 0}} ms</div><div class="muted">ETA ${{duration(b.estimated_finish_ms)}} · circuit ${{esc(b.circuit_state)}}${{staleResetText}}</div></td>
       <td><strong>${{fmt.format(nodeRoutes.length)}}</strong><div class="muted">${{nodeSuccess}} ok · ${{nodeFailed}} failed</div></td>

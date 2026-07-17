@@ -317,3 +317,14 @@ def test_dashboard_no_hard_minwidth_and_scroll_wrapper():
     assert "min-width: 320px" not in html, "node-gauges hard min-width would force overflow"
     # The table should carry a min-width so it scrolls rather than squishes
     assert "min-width: 760px" in html, "table needs a min-width to scroll predictably"
+
+
+def test_dashboard_model_column_wraps_and_matches_target_width():
+    """Model column should share width with Target column and wrap, not force overflow."""
+    from hermes_router import dashboard_html
+    html = dashboard_html("9.9.9")
+    assert "col-target" in html, "Target column class missing"
+    assert "col-model" in html, "Model column class missing"
+    assert "model-name" in html, "model-name wrapper missing"
+    # equal fixed widths declared
+    assert html.count("min-width: 220px") >= 2, "Target and Model must share a width"
