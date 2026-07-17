@@ -49,6 +49,25 @@ def expand_env(value: Any) -> Any:
     return value
 
 
+def _get_cpu_ram_info() -> dict[str, Any]:
+    # Return system RAM stats for CPU-only backends.
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        return {
+            "memory_total_mb": int(mem.total // (1024 * 1024)),
+            "memory_used_mb": int(mem.used // (1024 * 1024)),
+            "memory_used_percent": round(mem.percent, 1),
+            "utilization_percent": round(mem.percent, 1),
+            "temperature_c": None,
+            "swap_total_mb": int(swap.total // (1024 * 1024)),
+            "swap_used_mb": int(swap.used // (1024 * 1024)),
+        }
+    except ImportError:
+        return {}
+
+
 class BackendConfig(BaseModel):
     name: str
     api_base: str
@@ -60,6 +79,7 @@ class BackendConfig(BaseModel):
     preferred_for_long_context: bool = False
     weight: int = 1
     allowed_endpoints: list[str] | None = None
+    hardware: str = "auto"
 
 
 class FallbackConfig(BaseModel):
@@ -1688,6 +1708,10 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
     watchdog = backend.last_watchdog_status or {}
     gpu = watchdog.get("gpu") or {}
     llama = watchdog.get("llama") or {}
+    # Determine hardware type
+    hw = cfg.hardware if cfg.hardware != "auto" else ("cpu" if not gpu else "gpu")
+    if hw == "cpu":
+        gpu = _get_cpu_ram_info() if not gpu else gpu
     now = time.time()
     active_ages = [max(0.0, now - started_at) for started_at in backend.active_leases.values()]
     return {
@@ -1717,6 +1741,7 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
         "ready_reason": watchdog.get("reason"),
         "process_matches": watchdog.get("process_matches") or [],
         "gpu": gpu,
+        "hardware_type": hw,
         "llama": llama,
         "watchdog_checked_at": watchdog.get("checked_at"),
         "prompt_tokens_per_sec": round(backend.prompt_tokens_per_sec, 1),
@@ -2384,10 +2409,12 @@ function render(data) {{
   ].map(([k,v]) => `<div class="kv"><span class="mono muted">${{k}}</span><strong>${{v}}</strong></div>`).join("");
 
   document.getElementById("backendRows").innerHTML = data.backends.map((b) => {{
+    const isCpu = b.hardware_type === "cpu";
     const gpuUsed = pct(b.gpu && b.gpu.memory_used_percent);
     const gpuUtil = pct(b.gpu && b.gpu.utilization_percent);
-    const gpuTemp = b.gpu && b.gpu.temperature_c != null ? `${{b.gpu.temperature_c}}°C` : "n/a";
-    const gpuMem = b.gpu && b.gpu.memory_used_mb != null ? `${{gb(b.gpu.memory_used_mb)}} / ${{gb(b.gpu.memory_total_mb)}}` : "n/a";
+    const gpuTemp = b.gpu && b.gpu.temperature_c != null ? `${b.gpu.temperature_c}°C` : "n/a";
+    const gpuMem = b.gpu && b.gpu.memory_used_mb != null ? `${gb(b.gpu.memory_used_mb)} / ${gb(b.gpu.memory_total_mb)}` : "n/a";
+    const memLabel = isCpu ? "RAM" : "VRAM";
     const promptTps = b.prompt_tokens_per_sec > 0 ? b.prompt_tokens_per_sec.toFixed(1) : "n/a";
     const genTps = b.generated_tokens_per_sec > 0 ? b.generated_tokens_per_sec.toFixed(1) : "n/a";
     const semanticText = b.semantic_healthy == null
@@ -2414,9 +2441,9 @@ function render(data) {{
       <td>${{b.active_requests}}/${{b.max_parallel_requests}}<div class="muted">avg ${{b.latency_ms_average || 0}} ms</div><div class="muted">ETA ${{duration(b.estimated_finish_ms)}} · circuit ${{esc(b.circuit_state)}}${{staleResetText}}</div></td>
       <td><strong>${{fmt.format(nodeRoutes.length)}}</strong><div class="muted">${{nodeSuccess}} ok · ${{nodeFailed}} failed</div></td>
       <td><div class="node-gauges">
-        <div><div class="gauge-label">Memory</div><div class="gauge-value">${{gpuMem}}</div><div class="bar"><div class="fill" style="width:${{gpuUsed}}%"></div></div></div>
-        <div><div class="gauge-label">Util</div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div>
-        <div><div class="gauge-label">Temp</div><div class="gauge-value">${{gpuTemp}}</div></div>
+        <div><div class="gauge-label">${{memLabel}}</div><div class="gauge-value">${{gpuMem}}</div><div class="bar"><div class="fill" style="width:${{gpuUsed}}%"></div></div></div>
+        <div><div class="gauge-label">${{isCpu ? "RAM Load" : "Util"}}</div><div class="gauge-value">${{gpuUtil.toFixed(1)}}%</div><div class="bar"><div class="fill" style="width:${{gpuUtil}}%"></div></div></div>
+        ${{isCpu ? "" : `<div><div class="gauge-label">Temp</div><div class="gauge-value">${{gpuTemp}}</div></div>`}}
       </div></td>
       <td><div class="mono">${{promptTps}}</div></td>
       <td><div class="mono">${{genTps}}</div></td>
