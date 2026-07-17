@@ -472,6 +472,17 @@ class BackendState:
     semantic_tool_healthy: bool | None = None
     semantic_in_progress: bool = False
     semantic_lease_id: str = ""
+    backend_model: str = ""
+    max_context_tokens: int = 0
+    has_vision: bool = False
+    last_props_checked: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.config:
+            if self.max_context_tokens == 0:
+                self.max_context_tokens = self.config.max_context_tokens
+            if not self.backend_model:
+                self.backend_model = self.config.backend_model
 
 
 class RouterState:
@@ -518,6 +529,7 @@ class RouterState:
                 existing.cooldown_until = 0
                 existing.last_watchdog_status = None
                 existing.last_health_checked = 0
+                existing.last_props_checked = 0.0
             else:
                 self.backends.append(BackendState(config=backend_config))
 
@@ -1152,6 +1164,24 @@ def llama_health_url(api_base: str) -> str:
     return base.rstrip("/") + "/health"
 
 
+def llama_props_url(api_base: str) -> str:
+    base = api_base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/") + "/props"
+
+
+async def fetch_llama_props(client: httpx.AsyncClient, backend: BackendState) -> dict[str, Any] | None:
+    try:
+        url = llama_props_url(backend.config.api_base)
+        resp = await client.get(url, timeout=3.0)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
 def structured_log(event: str, **fields: Any) -> None:
     LOG.info(json.dumps({"event": event, **fields}, separators=(",", ":"), default=str))
 
@@ -1445,8 +1475,9 @@ def backend_snapshot(backend: BackendState) -> dict[str, Any]:
         "enabled": cfg.enabled,
         "api_base": cfg.api_base,
         "watchdog_base": cfg.watchdog_base,
-        "backend_model": cfg.backend_model,
-        "max_context_tokens": cfg.max_context_tokens,
+        "backend_model": backend.backend_model,
+        "max_context_tokens": backend.max_context_tokens,
+        "has_vision": backend.has_vision,
         "max_parallel_requests": cfg.max_parallel_requests,
         "preferred_for_long_context": cfg.preferred_for_long_context,
         "active_requests": backend.active_requests,
@@ -1490,9 +1521,11 @@ def router_snapshot(state: RouterState, config: RouterConfig) -> dict[str, Any]:
     token_backends = [b for b in state.backends if b.prompt_tokens_per_sec > 0]
     overall_prompt = round(sum(b.prompt_tokens_per_sec for b in token_backends) / max(len(token_backends), 1), 1)
     overall_gen = round(sum(b.generated_tokens_per_sec for b in token_backends) / max(len(token_backends), 1), 1)
+    has_vision = any(b.has_vision for b in state.backends if b.config.enabled)
     return {
         "ok": True,
         "model": config.public_model_name,
+        "has_vision": has_vision,
         "started_at": state.started_at,
         "uptime_seconds": round(time.time() - state.started_at, 1),
         "node_count": len(state.backends),
@@ -1535,11 +1568,30 @@ def router_snapshot(state: RouterState, config: RouterConfig) -> dict[str, Any]:
 
 
 async def refresh_backend_statuses(client: httpx.AsyncClient, state: RouterState, config: RouterConfig) -> None:
+    now = time.time()
     for backend in state.backends:
         await fetch_watchdog(client, backend, config.health_cache_seconds)
         prompt, predicted = await fetch_llama_metrics(client, backend.config.api_base)
         backend.prompt_tokens_per_sec = prompt
         backend.generated_tokens_per_sec = predicted
+
+        if now - backend.last_props_checked >= 10.0 or backend.last_props_checked == 0.0:
+            props = await fetch_llama_props(client, backend)
+            if props:
+                backend.last_props_checked = now
+                n_ctx = props.get("default_generation_settings", {}).get("n_ctx")
+                if isinstance(n_ctx, int) and n_ctx > 0:
+                    backend.max_context_tokens = n_ctx
+                modalities = props.get("modalities", {})
+                if isinstance(modalities, dict):
+                    backend.has_vision = bool(modalities.get("vision", False))
+                model_path = props.get("model_path")
+                if isinstance(model_path, str) and model_path:
+                    base_name = os.path.basename(model_path)
+                    name, _ = os.path.splitext(base_name)
+                    if name:
+                        backend.backend_model = name
+
         async with state._lock:
             if reap_stale_active_leases(backend, config):
                 state.telemetry_dirty = True
@@ -1549,7 +1601,7 @@ async def refresh_backend_statuses(client: httpx.AsyncClient, state: RouterState
 def semantic_canary_payload(backend: BackendState, config: SemanticHealthConfig, *, tool_check: bool) -> dict[str, Any]:
     if tool_check:
         return {
-            "model": backend.config.backend_model,
+            "model": backend.backend_model,
             "stream": False,
             "temperature": 0,
             "max_tokens": min(64, max(16, config.max_tokens)),
@@ -1578,7 +1630,7 @@ def semantic_canary_payload(backend: BackendState, config: SemanticHealthConfig,
             "tool_choice": {"type": "function", "function": {"name": "nyx_health_ping"}},
         }
     return {
-        "model": backend.config.backend_model,
+        "model": backend.backend_model,
         "stream": False,
         "temperature": 0,
         "max_tokens": config.max_tokens,
@@ -2086,7 +2138,7 @@ function render(data) {{
   document.getElementById("errorRate").textContent = total > 0 ? `${{errPct.toFixed(1)}}%` : "n/a";
   document.getElementById("errorRateHint").textContent = `${{fmt.format(failed)}} / ${{fmt.format(total)}}`;
   document.getElementById("updated").textContent = `Updated ${{new Date().toLocaleTimeString()}} · uptime ${{uptime(data.uptime_seconds)}}`;
-  document.getElementById("modelName").textContent = `model=${{data.model}}`;
+  document.getElementById("modelName").textContent = `model=${{data.model}}${{data.has_vision ? " (vision)" : ""}}`;
   document.getElementById("clusterSummary").textContent = `${{data.ready_nodes}} Node${{data.ready_nodes === 1 ? "" : "s"}} Online. Cluster Load at ${{clusterLoad}}%.`;
   document.getElementById("metadata").innerHTML = [
     ["Router Uptime", uptime(data.uptime_seconds)],
@@ -2128,7 +2180,7 @@ function render(data) {{
     return `<tr>
       <td><span class="status ${{statusClass(b)}}">${{esc(statusText(b))}}</span></td>
       <td><strong>${{esc(b.name)}}</strong><div class="muted mono">${{esc(b.watchdog_base || "watchdog=none")}}</div><div class="muted mono">${{esc(b.api_base)}}</div><div class="muted mono">${{semanticText}}</div></td>
-      <td>${{esc(b.backend_model)}}</td>
+      <td>${{esc(b.backend_model)}}${{b.has_vision ? ' <span style="background:var(--accent);color:var(--accent-foreground);padding:2px 4px;font-size:0.7rem;font-weight:bold;margin-left:6px;border-radius:2px">VISION</span>' : ''}}</td>
       <td>${{fmt.format(b.max_context_tokens || 0)}}</td>
       <td>${{b.active_requests}}/${{b.max_parallel_requests}}<div class="muted">avg ${{b.latency_ms_average || 0}} ms</div><div class="muted">ETA ${{duration(b.estimated_finish_ms)}} · circuit ${{esc(b.circuit_state)}}${{staleResetText}}</div></td>
       <td><strong>${{fmt.format(nodeRoutes.length)}}</strong><div class="muted">${{nodeSuccess}} ok · ${{nodeFailed}} failed</div></td>
@@ -2717,7 +2769,7 @@ async def forward_non_stream(
             url,
             rewrite_payload(
                 payload,
-                backend.config.backend_model,
+                backend.backend_model,
                 thinking_enabled,
                 dynamic_thinking,
                 reasoning_effort,
@@ -2875,7 +2927,7 @@ async def forward_stream(
                     url,
                     json=rewrite_payload(
                         payload,
-                        current.config.backend_model,
+                        current.backend_model,
                         thinking_enabled,
                         dynamic_thinking,
                         reasoning_effort,
@@ -3056,6 +3108,7 @@ async def apply_config_reload(app: FastAPI, current: RouterConfig, updated: Rout
                     backend.semantic_checked_at = 0
                     backend.semantic_consecutive_failures = 0
                     backend.semantic_error = ""
+                    backend.last_props_checked = 0.0
             reloaded_backends.append(backend)
 
         if current.cache_affinity_ttl_seconds != updated.cache_affinity_ttl_seconds:
@@ -3210,7 +3263,9 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
-        context_length = max((backend.max_context_tokens for backend in config.backends if backend.enabled), default=262144)
+        state: RouterState = app.state.router_state
+        context_length = max((backend.max_context_tokens for backend in state.backends if backend.config.enabled), default=262144)
+        has_vision = any(backend.has_vision for backend in state.backends if backend.config.enabled)
         model_ids = [config.public_model_name]
         if config.reasoning.expose_reasoning_models:
             model_ids.extend(f"{config.public_model_name}:{effort}" for effort in SUPPORTED_EFFORTS)
@@ -3222,6 +3277,11 @@ def create_app(config: RouterConfig, config_path: str = "") -> FastAPI:
                     "object": "model",
                     "owned_by": "hermes-qwen-pool",
                     "context_length": context_length,
+                    "modalities": {"vision": has_vision},
+                    "architecture": {
+                        "input_modalities": ["text", "image"] if has_vision else ["text"],
+                        "output_modalities": ["text"],
+                    },
                 }
                 for model_id in model_ids
             ],
